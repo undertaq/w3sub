@@ -1,23 +1,23 @@
 import os
 import shutil
 
-def process_files(src_dir, dest_dir, process):
+def process_files(src_dir, dest_dir, infiles, process):
   for root, dirs, files in os.walk(src_dir):
     for file in files:
-      if file in ["en.w3strings", "zh.w3strings"]:
+      if file in infiles:
         new_file_path = os.path.join(dest_dir, os.path.relpath(os.path.join(root, file), src_dir))
         if not os.path.exists(new_file_path):
           os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
         print("%s %s to %s" % (process, os.path.join(root, file), new_file_path))
         process(os.path.join(root, file), new_file_path)
 
-def copy_files(src_dir, dest_dir):
-    process_files(os.path.join(src_dir, "content"), os.path.join(dest_dir, "content"), shutil.copyfile)
-    process_files(os.path.join(src_dir, "dlc"), os.path.join(dest_dir, "dlc"), shutil.copyfile)
+def copy_files(src_dir, dest_dir, files):
+    process_files(os.path.join(src_dir, "content"), os.path.join(dest_dir, "content"), files, shutil.copyfile)
+    process_files(os.path.join(src_dir, "dlc"), os.path.join(dest_dir, "dlc"), files, shutil.copyfile)
 
 # convert w3strings files to csv files by w3strings.exe
-def convert_files(src_dir, dest_dir):
-  process_files(src_dir, dest_dir, lambda src, dest: os.system("w3strings.exe -d %s" % (src)))
+def convert_files(src_dir, dest_dir, files):
+  process_files(src_dir, dest_dir, files, lambda src, dest: os.system("w3strings.exe -d %s" % (src)))
 
 # read two files of the following text format: 
 # file #1: 
@@ -82,23 +82,34 @@ def write_combined_file(file_path, comments, combined_data):
           for text in comments:
             file.write(text + '\n')
         for key, texts in combined_data.items():
-            combined_text = '<br>'.join(texts)
+            if(key[1] != "00000000" or len(key[0]) >= 7):
+              combined_text = ' '.join(texts)
+            else:
+              combined_text = '<br>'.join(texts)
             file.write(f'{key[0].rjust(10)}|{key[1]}|| {combined_text}\n')
 
 
 backup_dir = "./backup"
 working_dir = "./working"
-witcher3_dir = "./witcher3"
+#witcher3_dir = "./witcher3"
+witcher3_dir = "I:/SteamLibrary/steamapps/common/The Witcher 3"
  
 if __name__ == "__main__":
-#  copy_files(witcher3_dir, backup_dir)
-#  copy_files(witcher3_dir, working_dir)
-#  convert_files(working_dir, working_dir)
+  w3in_files = ["zh.w3strings", "en.w3strings"]
+  w3out_file = "combined.w3strings"
+
+
+  #copy_files(witcher3_dir, backup_dir, w3in_files)
+  #copy_files(witcher3_dir, working_dir, w3in_files)
+  #convert_files(working_dir, working_dir, w3in_files)
+
   
   combine_files(os.path.join(working_dir, "content", "content0", "zh.w3strings.csv"), 
                 os.path.join(working_dir, "content", "content0", "en.w3strings.csv"),
                 os.path.join(working_dir, "content", "content0", "combined.w3strings.csv"),
                 )
-  os.system("w3strings.exe -e combined.w3strings.csv --force-ignore-id-space-check-i-know-what-i-am-doing")  
+  os.system("w3strings.exe" + " -e " + os.path.join(working_dir, "content", "content0", "combined.w3strings.csv") + " --force-ignore-id-space-check-i-know-what-i-am-doing")  
   
-  
+  # rename combined.w3strings.csv to zh.w3strings
+  os.rename(os.path.join(working_dir, "content", "content0", "combined.w3strings.csv.w3strings"), 
+            os.path.join(working_dir, "content", "content0", "1zh.w3strings"))  
