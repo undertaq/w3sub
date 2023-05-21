@@ -98,13 +98,20 @@ def write_combined_file(file_path, comments, combined_data):
         if comments:
           for text in comments:
             file.write(text + '\n')
+        # check which one is english
+        en_inx = not "en" in comments
+
         for key, texts in combined_data.items():
             #if(key[1] != "00000000" or len(key[0]) >= 7):
-            # if the last character of texts[1] is ".,?!" then insert <br>
-            if texts[1][-1] in ".,?!]…":
+            # if the last character of texts[1] is ".,?!" or texts[1] is longer than 32 characters,then insert <br>
+            if texts[en_inx][-1] in ".,?!]…" or len(texts[en_inx]) > 32:
               combined_text = '<br>'.join(texts)
             else:
-              combined_text = ' '.join(texts)
+              if dialogue_only:
+                combined_text = texts[0]
+              else:
+                combined_text = ' '.join(texts)
+
             file.write(f'{key[0].rjust(10)}|{key[1]}|| {combined_text}\n')
 
 def combine_files(src_dir, dest_dir, infile1, infile2, outfile):
@@ -116,8 +123,9 @@ working_dir = "./working"
 witcher3_dir = "I:/SteamLibrary/steamapps/common/The Witcher 3"
 #install_dir = "./install"
 install_dir = witcher3_dir
-
 installed_file = "dualsub.installed"
+dialogue_only = True
+
 if __name__ == "__main__":
   w3in_files = ["zh.w3strings", "en.w3strings"]
   w3out_file = "combined.csv"
