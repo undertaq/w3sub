@@ -115,16 +115,16 @@ def write_combined_file(file_path, comments, combined_data):
             file.write(f'{key[0].rjust(10)}|{key[1]}|| {combined_text}\n')
 
 def combine_files(src_dir, dest_dir, infile1, infile2, outfile):
-   process_files(src_dir, dest_dir, [infile1, infile2], 
+   process_files(src_dir, dest_dir, [infile1], 
                  lambda src, dest: combine_file(src, os.path.join(os.path.dirname(src), infile2), os.path.join(os.path.dirname(dest), outfile)))
    
 backup_dir = "./backup"
 working_dir = "./working"
 witcher3_dir = "I:/SteamLibrary/steamapps/common/The Witcher 3"
-#install_dir = "./install"
-install_dir = witcher3_dir
+install_dir = "./install"
+#install_dir = witcher3_dir
 installed_file = "dualsub.installed"
-dialogue_only = True
+dialogue_only = False
 
 if __name__ == "__main__":
   w3in_files = ["zh.w3strings", "en.w3strings"]
