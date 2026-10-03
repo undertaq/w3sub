@@ -11,6 +11,11 @@ class Storefront(Enum):
     UNKNOWN = "unknown"
 
 
+class MergeMode(Enum):
+    FULL_TEXT = "full_text"
+    DIALOGUE_ONLY = "dialogue_only"
+
+
 @dataclass(frozen=True)
 class GameCandidate:
     root: Path
