@@ -183,19 +183,19 @@ class GenerationRecord:
 - Produces `W3StringsConverter(executable: Path)`, `decode(source: Path, work_dir: Path) -> Path`, `encode(csv_path: Path, work_dir: Path) -> Path`, and `merge_csv(primary: Path, secondary: Path, mode: MergeMode, dialogue_index: DialogueIndex | None) -> Path`.
 - `DialogueIndex` is defined in Task 4; Task 3 accepts `None`, and Task 4 changes missing/stale/unclassifiable dialogue context to preserve the primary row. The GUI disables dialogue-only mode when no validated index is available.
 
-- [ ] **Step 1: Add tests** for converter exit errors, argument-safe paths containing spaces, CSV metadata comments, text with `|` and `<br>`, record matching by `(id, key)`, primary-only retention, secondary-only omission, and primary-first `<br>` output in full-text mode.
-- [ ] **Step 2: Run focused tests and confirm they fail.**
+- [x] **Step 1: Add tests** for converter exit errors, argument-safe paths containing spaces, CSV metadata comments, text with `|` and `<br>`, record matching by `(id, key)`, primary-only retention, secondary-only omission, and primary-first `<br>` output in full-text mode.
+- [x] **Step 2: Run focused tests and confirm they fail.**
 
   Run: `python -m unittest tests.test_converter tests.test_merge -v`
 
-- [ ] **Step 3: Implement the converter adapter** using `subprocess.run([...], cwd=work_dir, capture_output=True, text=True, check=False)` with no shell. Decode with `--decode`; encode with `--encode` and the existing `--force-ignore-id-space-check-i-know-what-i-am-doing` option. Copy source assets into managed staging before conversion. Require exit code zero and expected output file existence; include captured diagnostics in `ConverterError`.
-- [ ] **Step 4: Implement the CSV parser** using the converter's four-column pipe format. Split each data row at most three times so delimiters inside text stay in the text field. Preserve comments/header metadata and source ordering; reject malformed rows and ambiguous duplicate keys.
-- [ ] **Step 5: Implement full-text merge** by matching relative resources and `(string_id, key)`, retaining primary-only records, ignoring secondary-only records, and joining matching text as `primary + "<br>" + secondary`.
-- [ ] **Step 6: Validate converter compatibility** on copies of representative selected-game source files using decode/re-encode checks. Confirm that bundled v0.4.1 rejects format 164 and that this disables generation; keep the live game and repository's generated trees unchanged.
+- [x] **Step 3: Implement the converter adapter** using `subprocess.run([...], cwd=work_dir, capture_output=True, text=True, check=False)` with no shell. Decode with `--decode`; encode with `--encode` and the existing `--force-ignore-id-space-check-i-know-what-i-am-doing` option. Copy source assets into managed staging before conversion. Require exit code zero and expected output file existence; include captured diagnostics in `ConverterError`.
+- [x] **Step 4: Implement the CSV parser** using the converter's four-column pipe format. Split each data row at most three times so delimiters inside text stay in the text field. Preserve comments/header metadata and source ordering; reject malformed rows and ambiguous duplicate keys.
+- [x] **Step 5: Implement full-text merge** by matching relative resources and `(string_id, key)`, retaining primary-only records, ignoring secondary-only records, and joining matching text as `primary + "<br>" + secondary`.
+- [x] **Step 6: Validate converter compatibility** on copies of representative selected-game source files using decode/re-encode checks. Confirm that bundled v0.4.1 rejects format 164, record that failure as a generation gate for the GUI task, and keep the live game and repository's generated trees unchanged.
 
   Run: `python -m unittest tests.test_converter tests.test_merge -v`
 
-- [ ] **Step 7: Commit** `feat: convert and merge localized string files`.
+- [x] **Step 7: Commit** `feat: convert and merge localized string files`.
 
 ### Task 4: Version-matched dialogue context index
 
@@ -210,15 +210,15 @@ class GenerationRecord:
 - `DialogueIndex.context_for(string_id: str, key: str) -> DialogContext` returns one of `SCENE_SUBTITLE`, `OVERHEAD`, `ITEM`, `HUD_UI`, `OBJECTIVE`, `OTHER`, `AMBIGUOUS`, or `UNKNOWN`; the index also exposes `game_version: GameVersion`, `source_fingerprint: ResourceFingerprint`, and `digest: str`.
 - Task 4 extends `merge_csv(..., current_game: GameInstallation | None = None)` so dialogue-only rows merge only when the index is validated and current for the selected game's exact version and source fingerprint. Missing current game/index leaves rows primary-only.
 
-- [ ] **Step 1: Probe the local Remastered 5.00 resource structure** and identify a structured source that links localization IDs to in-dialogue scene subtitles and distinguishes them from gameplay oneliners/overhead text, items, and UI. Record the exact source paths/schema and whether they can be parsed from a normal game installation without REDkit being installed.
-- [ ] **Step 2: Add classifier tests** for a known scene subtitle, overhead/oneliner, item, objective, multiply-used ID, unknown ID, and stale index fingerprint. Unknown, ambiguous, and every non-`SCENE_SUBTITLE` context must remain primary-only.
-- [ ] **Step 3: Implement a version-keyed index only from confirmed structured references.** Store the executable version, relevant source-resource fingerprints, index schema version, and index digest. Never infer context from text length, punctuation, or wording.
-- [ ] **Step 4: Integrate dialogue-only merge.** If the index is missing, stale, or cannot classify an ID, leave that primary row unchanged. If no supported context source can be parsed for a build, return `None` so the GUI can disable dialogue-only mode while full-text mode remains available.
-- [ ] **Step 5: Run focused checks** and inspect representative output rows from the selected build; verify that only known in-scene subtitle IDs receive secondary text and overhead, item, UI, objective, ambiguous, and unknown entries do not.
+- [x] **Step 1: Probe the local Remastered 5.00 resource structure** and identify a structured source that links localization IDs to in-dialogue scene subtitles and distinguishes them from gameplay oneliners/overhead text, items, and UI. Record the exact source paths/schema and whether they can be parsed from a normal game installation without REDkit being installed. If no confirmed source is present or parseable, record that limitation and fail closed.
+- [x] **Step 2: Add classifier tests** for a known scene subtitle, overhead/oneliner, item, objective, multiply-used ID, unknown ID, and stale index fingerprint. Unknown, ambiguous, and every non-`SCENE_SUBTITLE` context must remain primary-only.
+- [x] **Step 3: Implement a version-keyed index only from confirmed structured references.** Store the executable version, relevant source-resource inventory and fingerprints, index schema version, and index digest. Never infer context from text length, punctuation, or wording.
+- [x] **Step 4: Integrate dialogue-only merge.** If the index is missing, stale, or cannot classify an ID, leave that primary row unchanged. If no supported context source can be parsed for a build, return `None` so the GUI can disable dialogue-only mode while full-text mode remains available.
+- [x] **Step 5: Run focused checks** against synthetic rows for scene, overhead, item, UI, objective, ambiguous, and unknown contexts. When the selected build exposes no confirmed source, verify that index build/load return unavailable with a clear reason; do not claim live dialogue-only output.
 
   Run: `python -m unittest tests.test_dialogue_index tests.test_merge -v`
 
-- [ ] **Step 6: Commit** `feat: classify scene subtitle strings by resource context`.
+- [x] **Step 6: Commit** `feat: classify scene subtitle strings by resource context`.
 
 ### Task 5: Generation records and stale-output detection
 
