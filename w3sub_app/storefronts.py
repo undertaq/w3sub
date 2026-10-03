@@ -92,7 +92,7 @@ def _vdf(text: str) -> dict:
 def _read_vdf(path):
     try:
         return _vdf(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return {}
 
 

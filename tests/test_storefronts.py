@@ -176,6 +176,17 @@ class StorefrontTests(unittest.TestCase):
         candidate, = self.discover()
         self.assertEqual(candidate.root, game.resolve())
 
+    def test_deeply_nested_vdf_does_not_abort_other_record_discovery(self):
+        library = self.base / "library"
+        game = self.game("library/steamapps/common/The Witcher 3")
+        self.steam(library, game)
+        (library / "steamapps/libraryfolders.vdf").write_text(
+            '"libraryfolders" { ' + '"nested" { ' * 2000)
+        self.roots = StoreRoots(steam_roots=(library,))
+        candidate, = self.discover()
+        self.assertEqual(candidate.root, game.resolve())
+        self.assertEqual(candidate.store_build_id, "12345")
+
 
 if __name__ == "__main__":
     unittest.main()
