@@ -297,11 +297,11 @@ class GenerationRecord:
 - Modify: `README.md`
 - Create: `tests/test_workflow.py`
 
-- [ ] **Step 1: Document** Python launch instructions, storefront discovery, supported version checks, language pairing semantics, dialogue-only index limitation, backup location, hash conflicts, update/regenerate workflow, and uninstall behavior.
-- [ ] **Step 2: Add a copied-fixture workflow check** covering scan, generation, stale detection, install, modify from originals, and uninstall; never run a destructive lifecycle against the user's live game during this check.
-- [ ] **Step 3: Run the full verification set** and manually inspect generated outputs and fixture file hashes.
+- [x] **Step 1: Document** Python launch instructions, storefront discovery, supported version checks, language pairing semantics, dialogue-only index limitation, backup location, hash conflicts, update/regenerate workflow, and uninstall behavior.
+- [x] **Step 2: Add a copied-fixture workflow check** covering scan, generation, stale detection, install, modify from originals, and uninstall; never run a destructive lifecycle against the user's live game during this check.
+- [x] **Step 3: Run the full verification set** and manually inspect generated outputs and fixture file hashes.
 
   Run: `python -m unittest discover -s tests -v`
 
-- [ ] **Step 4: Manually scan the live F: game folder** without installing; confirm version, languages, converter result, storefront label, and exact file inventory. Only install to the live game in a separate user-authorized action.
-- [ ] **Step 5: Commit** `docs: describe dual subtitle manager workflow`.
+- [x] **Step 4: Manually scan the live F: game folder** without installing; confirm version, languages, converter result, storefront label, and exact file inventory. Only install to the live game in a separate user-authorized action.
+- [x] **Step 5: Commit** `docs: describe dual subtitle manager workflow`.
