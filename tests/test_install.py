@@ -245,6 +245,53 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(result.conflicts, (relative,))
         self.assertEqual(target.read_bytes(), installed)
 
+    def test_copy_new_preserves_a_destination_it_did_not_create(self):
+        source = self.base / "copy source.bin"
+        destination = self.base / "existing destination.bin"
+        source.write_bytes(b"replacement")
+        destination.write_bytes(b"preserve existing")
+
+        with self.assertRaises(FileExistsError):
+            install._copy_new(source, destination)
+
+        self.assertEqual(destination.read_bytes(), b"preserve existing")
+
+    def test_new_backup_rejects_redirected_parent_without_touching_outside_or_game(self):
+        first_generation = self.generate_record()
+        manifest = install.install_generation(self.game, first_generation, self.state_root)
+        new_directory = self.game_root / "content/new0"
+        new_directory.mkdir()
+        new_en = new_directory / "en.w3strings"
+        new_en.write_bytes(b"new English baseline")
+
+        outside_directory = self.base / "outside backup destination"
+        outside_directory.mkdir()
+        outside_target = outside_directory / "en.w3strings"
+        outside_target.write_bytes(new_en.read_bytes())
+        redirected_parent = manifest.backup_directory / "content" / "new0"
+        try:
+            redirected_parent.symlink_to(outside_directory, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlink creation is not available")
+
+        game_before = {
+            path.relative_to(self.game_root).as_posix(): path.read_bytes()
+            for path in self.game_root.rglob("*") if path.is_file()
+        }
+        outside_before = outside_target.read_bytes()
+        with self.assertRaises(install.InstallError):
+            install._copy_new_backups(
+                manifest, self.game, {"content/new0/en.w3strings"}
+            )
+
+        game_after = {
+            path.relative_to(self.game_root).as_posix(): path.read_bytes()
+            for path in self.game_root.rglob("*") if path.is_file()
+        }
+        self.assertEqual(game_after, game_before)
+        self.assertEqual(outside_target.read_bytes(), outside_before)
+        self.assertEqual(tuple(outside_directory.iterdir()), (outside_target,))
+
     def test_unexpected_files_survive_uninstall(self):
         record = self.generate_record()
         manifest = install.install_generation(self.game, record, self.state_root)

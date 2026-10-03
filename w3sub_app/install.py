@@ -418,49 +418,106 @@ class _OperationLock:
 def _copy_new(source: Path, destination: Path) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
+    created_destination = False
     try:
-        with Path(source).open("rb") as input_file, destination.open("xb") as output_file:
-            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
-                digest.update(chunk)
-                output_file.write(chunk)
-            output_file.flush()
-            os.fsync(output_file.fileno())
+        with Path(source).open("rb") as input_file:
+            with destination.open("xb") as output_file:
+                created_destination = True
+                for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    output_file.write(chunk)
+                output_file.flush()
+                os.fsync(output_file.fileno())
     except OSError:
-        destination.unlink(missing_ok=True)
+        if created_destination:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
     return digest.hexdigest()
 
 
+def _lexical_path_identity(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+def _prepare_backup_destination(state_directory: Path, backup_directory: Path,
+                                install_id: str, game_root: Path, relative: str,
+                                *, create_parents: bool) -> Path:
+    """Validate every backup parent before a new backup is read or written."""
+    parts = _safe_relative(relative)
+    state = _validate_state_directory(state_directory, game_root)
+    expected_backup_directory = state / "backups" / install_id
+    if (_lexical_path_identity(Path(backup_directory))
+            != _lexical_path_identity(expected_backup_directory)):
+        raise InstallError("Backup directory does not match the manifest location")
+    raw_state = Path(state_directory).expanduser().absolute()
+    raw_games = raw_state.parent
+    try:
+        if _is_reparse(raw_games) or _is_reparse(raw_state):
+            raise InstallError("Game state parent is a symbolic link or junction")
+        if not raw_games.is_dir() or not raw_state.is_dir():
+            raise InstallError("Game state directory is unavailable")
+        games_resolved = raw_games.resolve(strict=True)
+        state_resolved = raw_state.resolve(strict=True)
+    except OSError as error:
+        raise InstallError(f"Cannot validate game state directory: {error}") from error
+    if state_resolved.parent != games_resolved or state_resolved != state:
+        raise InstallError("Game state directory resolves outside its declared location")
+    current = state
+    components = ("backups", install_id, *parts[:-1])
+    for component in components:
+        current = current / component
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            if not create_parents:
+                raise InstallError(f"Original backup parent is missing: {current}")
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise InstallError(f"Cannot create backup parent {current}: {error}") from error
+        except OSError as error:
+            raise InstallError(f"Cannot inspect backup parent {current}: {error}") from error
+        try:
+            if _is_reparse(current):
+                raise InstallError(f"Backup parent is a symbolic link or junction: {current}")
+            resolved = current.resolve(strict=True)
+        except OSError as error:
+            raise InstallError(f"Cannot resolve backup parent {current}: {error}") from error
+        if not _inside(resolved, state_resolved) or not resolved.is_dir():
+            raise InstallError(f"Backup parent escapes the game state folder: {current}")
+    return current / parts[-1]
+
+
 def _backup_target(root: Path, backup_directory: Path, relative: str) -> InstallTarget:
     target = _target_path(root, relative)
-    backup = backup_directory.joinpath(*_safe_relative(relative))
+    backup = _prepare_backup_destination(
+        backup_directory.parent.parent, backup_directory, backup_directory.name,
+        root, relative, create_parents=True,
+    )
     digest = _copy_new(target, backup)
-    if _hash_file(target) != digest or _hash_file(backup) != digest:
+    if (_hash_file(target) != digest or _hash_file(backup) != digest
+            or _is_reparse(backup)
+            or not _inside(backup.resolve(strict=True), backup_directory)):
         raise InstallError(f"Game target changed while it was being backed up: {relative}")
     return InstallTarget(relative, backup, digest, "0" * 64)
 
 
 def _validate_backup(manifest: InstallManifest, relative: str, target: InstallTarget) -> Path:
-    parts = _safe_relative(relative)
-    state = _validate_state_directory(manifest.state_directory, manifest.game_root)
-    backup_directory = Path(manifest.backup_directory)
-    expected_directory = state / "backups" / manifest.install_id
+    backup = _prepare_backup_destination(
+        manifest.state_directory, manifest.backup_directory, manifest.install_id,
+        manifest.game_root, relative, create_parents=False,
+    )
     try:
-        if _normalized_path(backup_directory) != expected_directory.resolve(strict=True):
-            raise InstallError("Backup directory does not match the manifest location")
-        if _is_reparse(backup_directory) or not backup_directory.is_dir():
-            raise InstallError("Backup directory is unavailable or redirected")
-        backup = Path(target.backup_path)
-        expected = backup_directory.joinpath(*parts)
-        if _normalized_path(backup) != expected.resolve(strict=True):
+        if _lexical_path_identity(Path(target.backup_path)) != _lexical_path_identity(backup):
             raise InstallError(f"Backup path is invalid for {relative}")
-        current = backup_directory
-        for part in parts:
-            current = current / part
-            if _is_reparse(current):
-                raise InstallError(f"Original backup path is redirected for {relative}")
-            if not _inside(current.resolve(strict=True), backup_directory):
-                raise InstallError(f"Original backup escapes its backup directory: {relative}")
+        if _is_reparse(backup) or not _inside(
+                backup.resolve(strict=True), manifest.backup_directory):
+            raise InstallError(f"Original backup path is redirected for {relative}")
         if not backup.is_file():
             raise InstallError(f"Original backup is unavailable for {relative}")
         if _hash_file(backup) != target.original_sha256:
@@ -799,16 +856,29 @@ def _copy_new_backups(manifest: InstallManifest, game: GameInstallation,
             _validate_backup(manifest, relative, targets[relative])
             continue
         path = _target_path(game.root, relative)
-        backup = manifest.backup_directory.joinpath(*_safe_relative(relative))
+        backup = _prepare_backup_destination(
+            manifest.state_directory, manifest.backup_directory,
+            manifest.install_id, game.root, relative, create_parents=True,
+        )
+        try:
+            final_is_reparse = _is_reparse(backup)
+        except FileNotFoundError:
+            final_is_reparse = False
+        if final_is_reparse:
+            raise InstallError(f"New original backup is a symbolic link or junction: {relative}")
         if backup.exists():
             if _is_reparse(backup) or not backup.is_file():
                 raise InstallError(f"Unexpected file blocks a new original backup: {relative}")
+            if not _inside(backup.resolve(strict=True), manifest.backup_directory):
+                raise InstallError(f"Existing original backup escapes its backup directory: {relative}")
             digest = _hash_file(backup)
         else:
             digest = _copy_new(path, backup)
         if digest != _hash_file(path) or digest != _hash_file(backup):
             raise InstallError(f"New target changed while being backed up: {relative}")
-        targets[relative] = InstallTarget(relative, backup, digest, "0" * 64)
+        new_target = InstallTarget(relative, backup, digest, "0" * 64)
+        _validate_backup(manifest, relative, new_target)
+        targets[relative] = new_target
     return targets
 
 
