@@ -208,7 +208,7 @@ class GenerationRecord:
 **Interfaces:**
 - Produces `DialogContext`, `DialogueIndex`, `load_dialogue_index(game: GameInstallation) -> DialogueIndex | None`, and `build_dialogue_index(game: GameInstallation) -> DialogueIndex | None`.
 - `DialogueIndex.context_for(string_id: str, key: str) -> DialogContext` returns one of `SCENE_SUBTITLE`, `OVERHEAD`, `ITEM`, `HUD_UI`, `OBJECTIVE`, `OTHER`, `AMBIGUOUS`, or `UNKNOWN`; the index also exposes `game_version: GameVersion`, `source_fingerprint: ResourceFingerprint`, and `digest: str`.
-- Task 3 consumes the index and merges only `SCENE_SUBTITLE` rows in `DIALOGUE_ONLY` mode.
+- Task 4 extends `merge_csv(..., current_game: GameInstallation | None = None)` so dialogue-only rows merge only when the index is validated and current for the selected game's exact version and source fingerprint. Missing current game/index leaves rows primary-only.
 
 - [ ] **Step 1: Probe the local Remastered 5.00 resource structure** and identify a structured source that links localization IDs to in-dialogue scene subtitles and distinguishes them from gameplay oneliners/overhead text, items, and UI. Record the exact source paths/schema and whether they can be parsed from a normal game installation without REDkit being installed.
 - [ ] **Step 2: Add classifier tests** for a known scene subtitle, overhead/oneliner, item, objective, multiply-used ID, unknown ID, and stale index fingerprint. Unknown, ambiguous, and every non-`SCENE_SUBTITLE` context must remain primary-only.
