@@ -4,9 +4,9 @@
 
 **Goal:** Build a Windows GUI that creates, installs, modifies, and uninstalls a version-aware dual-language subtitle update for The Witcher 3: Wild Hunt — Remastered 5.00.
 
-**Architecture:** Keep the existing Python project and `w3strings.exe`, split the current script into focused game discovery, conversion, merge, generation, install, and GUI modules. Store backups and generation metadata under the user's local application data, discover Steam/GOG/Epic installs from registry and storefront records, and only enable dialogue-only mode when a build-matched context index can be verified.
+**Architecture:** Keep the existing Python project and default to its local `w3strings.exe`; let the user select a compatible executable when needed. Split the current script into focused game discovery, conversion, merge, generation, install, and GUI modules. Store backups and generation metadata under the user's local application data, discover Steam/GOG/Epic installs from registry and storefront records, and only enable dialogue-only mode when a build-matched context index can be verified.
 
-**Tech Stack:** Python 3.10+, standard-library Tkinter, `subprocess`, `winreg`, JSON, SHA-256, and the existing `w3strings.exe` v0.4.1. Use Python's `unittest` for isolated module checks and copied game fixtures; no third-party runtime dependency is introduced.
+**Tech Stack:** Python 3.10+, standard-library Tkinter, `subprocess`, `winreg`, JSON, SHA-256, and the existing `w3strings.exe` v0.4.1 as the default converter. Since v0.4.1 cannot read Remastered format 164, generation requires a user-configured compatible executable until the default supports it. Use Python's `unittest` for isolated module checks and copied game fixtures; no third-party runtime dependency is introduced.
 
 **Spec:** `docs/superpowers/specs/2026-10-03-witcher3-dual-subtitle-manager-design.md`
 
@@ -15,7 +15,7 @@
 - Target Windows and The Witcher 3: Wild Hunt — Remastered 5.00.
 - Accept the game executable under `bin\x64` or `bin\x64_dx12`; reject unsupported major/minor versions.
 - Discover Steam, GOG, and Epic installations; validate candidates and allow manual browsing. Require `content` and a supported executable; scan `dlc` only when present and never treat `dlc-tombstones` as active resources.
-- Use standard-library Tkinter and the bundled `w3strings.exe`; do not add a GUI runtime dependency.
+- Use standard-library Tkinter and default to the local `w3strings.exe`; allow configuration of a compatible converter executable, and do not add a GUI runtime dependency or redistribute a third-party converter.
 - Store staging data, generation records, and backups outside the game directory under local application data, keyed by normalized game path.
 - Never use the game directory as scratch space or recursively delete game paths.
 - Pair resources and records by relative path, string ID, and key; keep primary text first and retain primary-only records.
@@ -173,6 +173,7 @@ class GenerationRecord:
 ### Task 3: Converter adapter and full-text merge
 
 **Files:**
+- Modify: `w3sub_app/models.py`
 - Create: `w3sub_app/converter.py`
 - Create: `w3sub_app/merge.py`
 - Create: `tests/test_converter.py`
@@ -190,7 +191,7 @@ class GenerationRecord:
 - [ ] **Step 3: Implement the converter adapter** using `subprocess.run([...], cwd=work_dir, capture_output=True, text=True, check=False)` with no shell. Decode with `--decode`; encode with `--encode` and the existing `--force-ignore-id-space-check-i-know-what-i-am-doing` option. Copy source assets into managed staging before conversion. Require exit code zero and expected output file existence; include captured diagnostics in `ConverterError`.
 - [ ] **Step 4: Implement the CSV parser** using the converter's four-column pipe format. Split each data row at most three times so delimiters inside text stay in the text field. Preserve comments/header metadata and source ordering; reject malformed rows and ambiguous duplicate keys.
 - [ ] **Step 5: Implement full-text merge** by matching relative resources and `(string_id, key)`, retaining primary-only records, ignoring secondary-only records, and joining matching text as `primary + "<br>" + secondary`.
-- [ ] **Step 6: Validate converter compatibility** on copies of representative 5.00 source files using decode/re-encode checks supported by v0.4.1; keep the live game and the repository's generated trees unchanged.
+- [ ] **Step 6: Validate converter compatibility** on copies of representative selected-game source files using decode/re-encode checks. Confirm that bundled v0.4.1 rejects format 164 and that this disables generation; keep the live game and repository's generated trees unchanged.
 
   Run: `python -m unittest tests.test_converter tests.test_merge -v`
 
@@ -278,11 +279,11 @@ class GenerationRecord:
 - GUI calls `discover_candidates`, `scan_game`, `generate`, `compare_generation`, `load_install_manifest`, `compare_install`, `install_generation`, `modify_install`, and `uninstall` from earlier tasks.
 - Config exposes `load_config() -> AppConfig`, `save_config(config: AppConfig) -> None`, and `state_root_for(game_root: Path) -> Path`.
 
-- [ ] **Step 1: Add config tests** for missing/invalid JSON, last valid game path fallback, stable normalized path hashes, and isolated per-game state directories.
-- [ ] **Step 2: Implement config/state paths** under `%LOCALAPPDATA%\W3DualSubtitle`; save last selection without storing credentials or storefront account data. Configure standard-library logging to an application log in this state root, retaining converter and rollback diagnostics while showing concise errors in the GUI.
-- [ ] **Step 3: Implement the Tkinter screen** with discovered-install selection, manual folder browse, detected version/store/languages, primary/secondary dropdowns, full-text/dialogue-only choice, scan status, generation preview, progress, and active Install/Modify/Uninstall actions. On startup, use registry/store discovery before the saved path; after any folder change, rescan and compare game/generation/install metadata. For Modify, build `GenerationRequest.source_overrides` from the manifest's exact original backups and compare against those same bytes. When an active install is stale because source assets changed, disable Generate/Install/Modify until safe uninstall; keep Uninstall available when managed hashes match. If installed hashes conflict, disable mutations and show affected files plus backup paths for manual resolution.
+- [ ] **Step 1: Add config tests** for missing/invalid JSON, last valid game path fallback, stable normalized path hashes, isolated per-game state directories, and configured converter path persistence.
+- [ ] **Step 2: Implement config/state paths** under `%LOCALAPPDATA%\W3DualSubtitle`; save the selected converter path and last game selection without storing credentials or storefront account data. Configure standard-library logging to an application log in this state root, retaining converter and rollback diagnostics while showing concise errors in the GUI.
+- [ ] **Step 3: Implement the Tkinter screen** with discovered-install selection, manual folder browse, converter executable browse and compatibility status, detected version/store/languages, primary/secondary dropdowns, full-text/dialogue-only choice, scan status, generation preview, progress, and active Install/Modify/Uninstall actions. On startup, use registry/store discovery before the saved path; after any folder change, rescan and compare game/generation/install metadata. Run the configured converter's compatibility check on copied source resources and disable generation until it passes. For Modify, build `GenerationRequest.source_overrides` from the manifest's exact original backups and compare against those same bytes. When an active install is stale because source assets changed, disable Generate/Install/Modify until safe uninstall; keep Uninstall available when managed hashes match. If installed hashes conflict, disable mutations and show affected files plus backup paths for manual resolution.
 - [ ] **Step 4: Run long operations on a worker thread** and deliver progress/results to Tk via a queue polled by `after()`. Disable conflicting controls while work runs and keep all error/rollback summaries visible.
-- [ ] **Step 5: Make `w3sub.py` launch the GUI only.** It must not perform an automatic install at startup and must resolve the converter relative to the source or packaged app directory.
+- [ ] **Step 5: Make `w3sub.py` launch the GUI only.** It must not perform an automatic install at startup and must resolve the default converter relative to the source or packaged app directory.
 - [ ] **Step 6: Run config tests and launch the GUI.** Confirm startup discovery finds the F: Steam install; verify changing the folder triggers a fresh version/language scan; verify unsupported classifier availability disables only dialogue-only mode.
 
   Run: `python -m unittest tests.test_config -v`

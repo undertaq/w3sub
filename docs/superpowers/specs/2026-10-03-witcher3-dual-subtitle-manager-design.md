@@ -72,11 +72,13 @@ supported target is the verified Remastered 5.00 Windows layout.
 
 ### Recommended: Tkinter UI with a separate Python core
 
-Keep Python and the existing converter. Put GUI, game discovery, merge logic,
-converter invocation, and installation state in focused modules. Use Tkinter
-from the Python standard library for a desktop window, keeping new runtime
-dependencies out of the project. This minimizes compatibility and packaging
-work while replacing the fragile script flow with testable boundaries.
+Keep Python and the existing converter as the default. Let the user select a
+compatible converter executable when the bundled converter cannot read the
+installed game format. Put GUI, game discovery, merge logic, converter
+invocation, and installation state in focused modules. Use Tkinter from the
+Python standard library for a desktop window, keeping new runtime dependencies
+out of the project. This minimizes compatibility and packaging work while
+replacing the fragile script flow with testable boundaries.
 
 ### PySide desktop UI
 
@@ -99,8 +101,9 @@ recommended for the first version.
 - `storefront_discovery`: read registry locations and each storefront's local
   install records, return validated game-root candidates with a storefront
   label, and deduplicate candidates that resolve to the same directory.
-- `converter`: invoke the bundled `w3strings.exe` with an argument list (never
-  a shell command), capture output/exit status, and report decode/encode errors.
+- `converter`: invoke the configured `w3strings.exe`-compatible executable
+  with an argument list (never a shell command), capture output/exit status,
+  and report decode/encode errors. Default to the local bundled executable.
 - `merger`: read the converter's CSV representation, pair records by string ID
   and key, combine primary text before secondary text, and produce a new CSV
   for the selected primary language.
@@ -114,9 +117,14 @@ recommended for the first version.
   Move processing into the focused modules; running the entry point must never
   install or modify the game without user interaction.
 
-The converter executable is resolved relative to the application bundle or
-source directory, not the current working directory. The game installation is
-never used as scratch space.
+The default converter executable is resolved relative to the application
+bundle or source directory, not the current working directory. Let the user
+select another compatible executable and remember that path in application
+configuration. Before generation, check that it supports the selected source
+format by decoding and re-encoding copies in managed staging. If the configured
+converter fails or cannot preserve the source format, disable generation and
+show its diagnostics. Do not download or redistribute an external converter.
+The game installation is never used as scratch space.
 
 ## Merge behavior
 
@@ -169,7 +177,10 @@ never used as scratch space.
 - Output files replace only the selected primary language's matching assets;
   all other languages and unrelated game files remain untouched.
 - Validate that the converter accepts the game's source resources before
-  enabling generation. Never continue with a partial conversion set.
+  enabling generation. The bundled v0.4.1 converter cannot read the verified
+  Remastered 5.00 format 164 files, so its compatibility check must fail closed.
+  Allow the user to configure a compatible converter that accepts the same
+  command-line interface; never continue with a partial conversion set.
 
 ## Install, modify, and uninstall
 
@@ -315,9 +326,9 @@ before installation.
 
 ## Verification approach
 
-Before enabling game-file changes, validate the converter against the selected
-installation's source resources and compare a decode/re-encode round trip where
-the converter supports it. During implementation, verify the merge behavior
+Before enabling generation, validate the configured converter against copies of
+the selected installation's source resources and compare a decode/re-encode
+round trip. Disable generation when that check fails. During implementation, verify the merge behavior
 with representative converter CSV inputs, exercise the GUI against the known
 game directory, and perform an install/modify/uninstall cycle against an
 isolated copied fixture rather than the live game. Confirm backup and installed
@@ -337,6 +348,7 @@ assuming every drive/library has identical contents.
 
 The implementation should first make discovery, conversion, merge, and
 transaction state reliable, then attach the GUI to those operations. A later
-packaging decision can bundle the Python app and converter into a distributable
-Windows executable; the first implementation may be launched from the local
-Python environment.
+packaging decision can bundle the Python app and local converter into a
+distributable Windows executable; the first implementation may be launched
+from the local Python environment. Do not package or redistribute a third-party
+converter without its author's permission.
