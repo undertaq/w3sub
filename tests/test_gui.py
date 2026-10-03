@@ -1,8 +1,11 @@
-from pathlib import Path
+from dataclasses import replace
 import json
+from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import w3sub_app.gui as gui_module
 from w3sub_app.converter import check_compatibility
 from w3sub_app.gui import (
     available_languages,
@@ -19,7 +22,7 @@ from w3sub_app.gui import (
     source_overrides_for_pair,
 )
 from w3sub_app.generation import generate, load_latest_generation_record
-from w3sub_app.install import install_generation
+from w3sub_app.install import InstallError, install_generation
 from w3sub_app.models import (
     Freshness,
     GameCandidate,
@@ -199,6 +202,229 @@ class GuiHelperTests(unittest.TestCase):
         result, _callback = payload
         self.assertIsNot(result, caller)
         self.assertEqual(result.name, "w3sub-fixture")
+
+    def test_submit_starts_operation_progress(self):
+        class Progress:
+            def __init__(self):
+                self.events = []
+
+            def start(self, *_args):
+                self.events.append("start")
+
+            def stop(self):
+                self.events.append("stop")
+
+        class Variable:
+            def set(self, _value):
+                pass
+
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app._busy = False
+        app._progress_running = False
+        app.operation_progress = Progress()
+        app.status_var = Variable()
+        app._set_controls_enabled = lambda _enabled: None
+        app._refresh_action_buttons = lambda: None
+        app._messages = object()
+        app.logger = object()
+        with patch("w3sub_app.gui.start_background_operation"):
+            app._submit("fixture", lambda: None, lambda _result: None)
+
+        self.assertTrue(app._busy)
+        self.assertEqual(app.operation_progress.events, ["start"])
+
+    def test_progress_stops_when_operation_completes(self):
+        import queue
+
+        class Progress:
+            running = True
+
+            def __init__(self):
+                self.events = []
+
+            def start(self, *_args):
+                self.running = True
+                self.events.append("start")
+
+            def stop(self):
+                self.running = False
+                self.events.append("stop")
+
+        class Variable:
+            def set(self, _value):
+                pass
+
+        class Root:
+            def after(self, *_args):
+                pass
+
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app._busy = True
+        app._progress_running = True
+        app.operation_progress = Progress()
+        app.status_var = Variable()
+        app._messages = queue.Queue()
+        app._messages.put(("fixture", (None, lambda _result: None), None))
+        app._set_controls_enabled = lambda _enabled: None
+        app._refresh_action_buttons = lambda: None
+        app.root = Root()
+
+        app._poll_messages()
+
+        self.assertFalse(app._busy)
+        self.assertFalse(app.operation_progress.running)
+        self.assertEqual(app.operation_progress.events, ["stop"])
+
+    def test_completion_callback_can_start_next_operation_without_stopping_progress(self):
+        import queue
+
+        class Progress:
+            running = True
+
+            def __init__(self):
+                self.events = []
+
+            def start(self, *_args):
+                self.running = True
+                self.events.append("start")
+
+            def stop(self):
+                self.running = False
+                self.events.append("stop")
+
+        class Variable:
+            def set(self, _value):
+                pass
+
+        class Root:
+            def after(self, *_args):
+                pass
+
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app._busy = True
+        app._progress_running = True
+        app.operation_progress = Progress()
+        app.status_var = Variable()
+        app._messages = queue.Queue()
+        app._messages.put(("first", (None, lambda _result: app._submit(
+            "second", lambda: None, lambda _next: None,
+        )), None))
+        app._set_controls_enabled = lambda _enabled: None
+        app._refresh_action_buttons = lambda: None
+        app.root = Root()
+        app.logger = object()
+
+        with patch("w3sub_app.gui.start_background_operation"):
+            app._poll_messages()
+
+        self.assertTrue(app._busy)
+        self.assertTrue(app.operation_progress.running)
+        self.assertEqual(app.operation_progress.events, [])
+
+    def test_window_close_is_refused_while_worker_is_active(self):
+        class Variable:
+            value = None
+
+            def set(self, value):
+                self.value = value
+
+        class Root:
+            destroyed = False
+
+            def destroy(self):
+                self.destroyed = True
+
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app._busy = True
+        app.status_var = Variable()
+        app.root = Root()
+        close_handler = getattr(app, "_on_close", None)
+        self.assertTrue(callable(close_handler), "the app needs a close guard")
+
+        self.assertFalse(close_handler())
+        self.assertFalse(app.root.destroyed)
+        self.assertIn("wait", app.status_var.value.casefold())
+
+        app._busy = False
+        self.assertTrue(close_handler())
+        self.assertTrue(app.root.destroyed)
+
+    def test_install_review_signature_detects_lifecycle_changes(self):
+        game = self.make_game("review-signature")
+        converter_path = self.base / "review-converter.exe"
+        converter_path.write_bytes(b"fixture converter")
+        state_root = self.base / "review-state"
+        generation_record = generate(
+            GenerationRequest(game, "en", "zh", MergeMode.FULL_TEXT),
+            state_root, FixtureConverter(converter_path),
+        )
+        manifest = install_generation(game, generation_record, state_root)
+        signature = getattr(gui_module, "install_manifest_review_signature", None)
+        self.assertTrue(callable(signature), "the GUI needs a lifecycle review signature")
+        if signature is None:
+            return
+        require_unchanged = getattr(gui_module, "require_reviewed_manifest", None)
+        self.assertTrue(callable(require_unchanged), "lifecycle actions must enforce the review signature")
+        if require_unchanged is None:
+            return
+
+        captured = signature(manifest)
+        self.assertIs(require_unchanged(captured, manifest), manifest)
+
+        relative, target = next(iter(manifest.target_files.items()))
+        altered_targets = (
+            replace(target, relative_path=target.relative_path + ".renamed"),
+            replace(target, backup_path=target.backup_path.with_name(
+                "different-original.w3strings")),
+            replace(target, original_sha256="0" * 64),
+            replace(target, installed_sha256="f" * 64),
+        )
+        changed_manifests = [
+            replace(manifest, generation_id="different-generation"),
+            replace(manifest, primary_language="pl"),
+        ]
+        for altered_target in altered_targets:
+            changed_targets = dict(manifest.target_files)
+            changed_targets[relative] = altered_target
+            changed_manifests.append(replace(manifest, target_files=changed_targets))
+
+        for changed_manifest in changed_manifests:
+            with self.subTest(manifest=changed_manifest):
+                self.assertNotEqual(captured, signature(changed_manifest))
+                with self.assertRaisesRegex(InstallError, "changed after confirmation"):
+                    require_unchanged(captured, changed_manifest)
+
+    def test_fresh_lifecycle_preflight_rejects_changed_manifest_before_comparison(self):
+        from unittest.mock import patch
+
+        game = self.make_game("fresh-review")
+        converter_path = self.base / "fresh-review-converter.exe"
+        converter_path.write_bytes(b"fixture converter")
+        state_root = self.base / "fresh-review-state"
+        generation_record = generate(
+            GenerationRequest(game, "en", "zh", MergeMode.FULL_TEXT),
+            state_root, FixtureConverter(converter_path),
+        )
+        manifest = install_generation(game, generation_record, state_root)
+        signature = gui_module.install_manifest_review_signature(manifest)
+        changed_manifest = replace(manifest, generation_id="new-generation")
+        selected = gui_module.ScannedGame(
+            GameCandidate(game.root, Storefront.STEAM, "fixture"), game,
+        )
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app.snapshot = gui_module.GameSnapshot(
+            selected, manifest, None, generation_record, Freshness.CURRENT, False,
+        )
+
+        with patch("w3sub_app.gui.scan_game", return_value=game), \
+             patch("w3sub_app.gui.config.state_root_for", return_value=state_root), \
+             patch("w3sub_app.gui.install.load_install_manifest",
+                   return_value=changed_manifest), \
+             patch("w3sub_app.gui.install.compare_install") as compare_install:
+            with self.assertRaisesRegex(InstallError, "changed after confirmation"):
+                app._fresh_game_and_manifest(reviewed_manifest_signature=signature)
+
+        compare_install.assert_not_called()
 
     def test_install_confirmation_lists_pair_targets_and_cancel_starts_no_operation(self):
         confirmation = confirmation_text(

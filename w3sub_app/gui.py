@@ -243,6 +243,50 @@ def confirm_then_submit(confirm, title: str, text: str, submit) -> bool:
     return True
 
 
+def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
+    """Identify the active install targets and backups shown in a confirmation."""
+    targets = tuple(sorted(
+        (
+            relative,
+            target.relative_path,
+            _path_identity(target.backup_path),
+            target.original_sha256,
+            target.installed_sha256,
+        )
+        for relative, target in manifest.target_files.items()
+    ))
+    return (
+        _path_identity(manifest.game_root),
+        _path_identity(manifest.state_directory),
+        _path_identity(manifest.backup_directory),
+        manifest.storefront,
+        manifest.store_build_id,
+        manifest.install_id,
+        manifest.generation_id,
+        manifest.generation_version,
+        manifest.install_version,
+        manifest.primary_language,
+        manifest.secondary_language,
+        manifest.mode,
+        manifest.source_fingerprint.digest,
+        targets,
+        manifest.active,
+        manifest.conflicted,
+        manifest.prepared,
+    )
+
+
+def require_reviewed_manifest(signature: tuple, manifest: InstallManifest | None
+                               ) -> InstallManifest:
+    """Refuse a lifecycle action if its confirmed install record has changed."""
+    if manifest is None or install_manifest_review_signature(manifest) != signature:
+        raise install.InstallError(
+            "The install changed after confirmation. Rescan the game and review the current "
+            "targets before confirming again."
+        )
+    return manifest
+
+
 def summarize_compatibility_error(error: str | None) -> str:
     detail = (error or "converter failed compatibility check").strip()
     match = re.search(
@@ -291,6 +335,7 @@ class W3DualSubtitleApp:
         self.converter_path = self.app_config.converter_path or default_converter_path()
         self._messages: queue.Queue = queue.Queue()
         self._busy = False
+        self._progress_running = False
         self._candidate_rows: tuple[ScannedGame, ...] = ()
         self.snapshot: GameSnapshot | None = None
         self.converter_compatible = False
@@ -298,6 +343,7 @@ class W3DualSubtitleApp:
         self._build_widgets()
         self.root.title("Witcher 3 Dual Subtitle Manager")
         self.root.minsize(760, 630)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self._poll_messages)
         self._submit("startup", self._startup_scan, self._startup_loaded)
 
@@ -390,14 +436,34 @@ class W3DualSubtitleApp:
         scroll.grid(row=0, column=1, sticky="ns")
         self.preview.configure(yscrollcommand=scroll.set)
         self.status_var = tk.StringVar(value="Ready")
+        self.operation_progress = ttk.Progressbar(frame, mode="indeterminate")
+        self.operation_progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(7, 0))
         ttk.Label(frame, textvariable=self.status_var, wraplength=800).grid(
-            row=9, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+            row=10, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self._set_controls_enabled(False)
+
+    def _sync_operation_progress(self):
+        if self._busy and not self._progress_running:
+            self.operation_progress.start()
+            self._progress_running = True
+        elif not self._busy and self._progress_running:
+            self.operation_progress.stop()
+            self._progress_running = False
+
+    def _on_close(self):
+        if self._busy:
+            self.status_var.set(
+                "An operation is still running. Wait for it to finish before closing the app."
+            )
+            return False
+        self.root.destroy()
+        return True
 
     def _submit(self, label, operation, on_success):
         if self._busy:
             return
         self._busy = True
+        self._sync_operation_progress()
         self.status_var.set(f"{label.capitalize()}…")
         self._set_controls_enabled(False)
         self._refresh_action_buttons()
@@ -429,6 +495,7 @@ class W3DualSubtitleApp:
                 else:
                     result, callback = payload
                     callback(result)
+                self._sync_operation_progress()
                 self._set_controls_enabled(not self._busy)
                 self._refresh_action_buttons()
         except queue.Empty:
@@ -728,7 +795,8 @@ class W3DualSubtitleApp:
         if not actions.dialogue_mode:
             self.dialogue_mode.configure(state="disabled")
 
-    def _fresh_game_and_manifest(self, allow_stale_install=False):
+    def _fresh_game_and_manifest(self, allow_stale_install=False,
+                                 reviewed_manifest_signature=None):
         if not self.snapshot:
             raise RuntimeError("Select a game folder first")
         selected = self.snapshot.selected
@@ -736,6 +804,8 @@ class W3DualSubtitleApp:
                          selected.candidate.store_build_id)
         state = config.state_root_for(game.root)
         manifest = install.load_install_manifest(state, game.root)
+        if reviewed_manifest_signature is not None:
+            manifest = require_reviewed_manifest(reviewed_manifest_signature, manifest)
         comparison = install.compare_install(manifest, game) if manifest else None
         if manifest and manifest.active:
             if comparison and comparison.conflict_paths:
@@ -824,9 +894,15 @@ class W3DualSubtitleApp:
         if not self.snapshot or not self.snapshot.generation_record:
             return
         record = self.snapshot.generation_record
+        reviewed_manifest = self.snapshot.manifest
+        if reviewed_manifest is None:
+            return
+        reviewed_signature = install_manifest_review_signature(reviewed_manifest)
 
         def operation():
-            game, _state, manifest, _comparison = self._fresh_game_and_manifest()
+            game, _state, manifest, _comparison = self._fresh_game_and_manifest(
+                reviewed_manifest_signature=reviewed_signature,
+            )
             if manifest is None or not manifest.active:
                 raise install.InstallError("There is no active install to modify")
             overrides = source_overrides_for_pair(
@@ -842,8 +918,7 @@ class W3DualSubtitleApp:
 
         root = self.snapshot.selected.game.root
         relative_targets = set(record.output_files)
-        if self.snapshot.manifest:
-            relative_targets.update(self.snapshot.manifest.target_files)
+        relative_targets.update(reviewed_manifest.target_files)
         targets = tuple(str(root.joinpath(*Path(path).parts)) for path in relative_targets)
         text = confirmation_text("Modify", root, record.primary_language,
                                  record.secondary_language, targets)
@@ -855,10 +930,13 @@ class W3DualSubtitleApp:
     def _uninstall(self):
         if not self.snapshot or not self.snapshot.manifest:
             return
+        reviewed_manifest = self.snapshot.manifest
+        reviewed_signature = install_manifest_review_signature(reviewed_manifest)
 
         def operation():
             game, _state, manifest, comparison = self._fresh_game_and_manifest(
                 allow_stale_install=True,
+                reviewed_manifest_signature=reviewed_signature,
             )
             if manifest is None or not manifest.active:
                 raise install.InstallError("There is no active install to uninstall")
@@ -879,7 +957,7 @@ class W3DualSubtitleApp:
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
             return result, self._load_game_snapshot(refreshed), result.restored_paths
 
-        manifest = self.snapshot.manifest
+        manifest = reviewed_manifest
         root = self.snapshot.selected.game.root
         targets = tuple(str(root.joinpath(*Path(path).parts))
                         for path in manifest.target_files)
