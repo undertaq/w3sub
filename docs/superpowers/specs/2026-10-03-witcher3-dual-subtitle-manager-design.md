@@ -72,13 +72,14 @@ supported target is the verified Remastered 5.00 Windows layout.
 
 ### Recommended: Tkinter UI with a separate Python core
 
-Keep Python and the existing converter as the default. Let the user select a
-compatible converter executable when the bundled converter cannot read the
-installed game format. Put GUI, game discovery, merge logic, converter
-invocation, and installation state in focused modules. Use Tkinter from the
-Python standard library for a desktop window, keeping new runtime dependencies
-out of the project. This minimizes compatibility and packaging work while
-replacing the fragile script flow with testable boundaries.
+Keep Python and use the built-in standard-library codec for verified
+`.w3strings` formats 162–164 by default. Let the user select a compatible
+converter executable as an explicit override. Put GUI, game discovery,
+structured merge logic, conversion, and installation state in focused modules.
+Use Tkinter from the Python standard library for a desktop window, keeping new
+runtime dependencies out of the project. This minimizes compatibility and
+packaging work while replacing the fragile script flow with testable
+boundaries.
 
 ### PySide desktop UI
 
@@ -101,12 +102,13 @@ recommended for the first version.
 - `storefront_discovery`: read registry locations and each storefront's local
   install records, return validated game-root candidates with a storefront
   label, and deduplicate candidates that resolve to the same directory.
-- `converter`: invoke the configured `w3strings.exe`-compatible executable
-  with an argument list (never a shell command), capture output/exit status,
-  and report decode/encode errors. Default to the local bundled executable.
-- `merger`: read the converter's CSV representation, pair records by string ID
-  and key, combine primary text before secondary text, and produce a new CSV
-  for the selected primary language.
+- `converter`: provide a standard-library reader/writer for the verified
+  formats, plus an optional adapter that invokes a configured compatible
+  executable with an argument list (never a shell command), captures
+  output/exit status, and reports decode/encode errors.
+- `merger`: merge native structured records by string ID and shared
+  localization-key hash, preserving exact text including embedded newlines;
+  retain the CSV path for an explicitly selected external converter.
 - `install_manager`: stage outputs, persist original files and a manifest,
   perform atomic per-file replacement with rollback on failure, and manage
   modify/uninstall conflict checks.
@@ -117,14 +119,13 @@ recommended for the first version.
   Move processing into the focused modules; running the entry point must never
   install or modify the game without user interaction.
 
-The default converter executable is resolved relative to the application
-bundle or source directory, not the current working directory. Let the user
-select another compatible executable and remember that path in application
-configuration. Before generation, check that it supports the selected source
-format by decoding and re-encoding copies in managed staging. If the configured
-converter fails or cannot preserve the source format, disable generation and
-show its diagnostics. Do not download or redistribute an external converter.
-The game installation is never used as scratch space.
+The built-in codec is the default. If the user explicitly selects an external
+converter, resolve and remember that path through application configuration.
+Before generation, check the selected backend by decoding, encoding, and
+decoding isolated copies, then compare semantic records and exact text. If an
+external converter fails or cannot preserve the selected source format,
+disable generation and show its diagnostics. Do not download or redistribute
+an external converter. The game installation is never used as scratch space.
 
 ## Merge behavior
 
@@ -149,8 +150,10 @@ The game installation is never used as scratch space.
 - Walk matching primary and secondary resource paths in `content` and in `dlc`
   when present. A missing `dlc` directory does not invalidate the base game;
   `dlc-tombstones` is not an active resource directory.
-- Match CSV records by both string ID and key, preserving source ordering and
-  comments where the converter format supports them.
+- Match native records by string ID and shared localization-key hash, keeping
+  every primary association and exact text code point. The external CSV path
+  matches by both string ID and key, preserving source ordering and comments
+  where the converter format supports them.
 - For a matching record, write the primary string first and the secondary
   string second separated by the game's supported line break marker (`<br>`).
 - Keep primary-only records unchanged so missing secondary translations do not
@@ -176,11 +179,10 @@ The game installation is never used as scratch space.
   dialogue-only support.
 - Output files replace only the selected primary language's matching assets;
   all other languages and unrelated game files remain untouched.
-- Validate that the converter accepts the game's source resources before
-  enabling generation. The bundled v0.4.1 converter cannot read the verified
-  Remastered 5.00 format 164 files, so its compatibility check must fail closed.
-  Allow the user to configure a compatible converter that accepts the same
-  command-line interface; never continue with a partial conversion set.
+- Validate that the selected backend accepts the game's source resources
+  before enabling generation. The built-in codec must pass semantic
+  decode/encode/decode checks; an explicitly selected external converter must
+  pass the same compatibility check. Never continue with a partial set.
 
 ## Install, modify, and uninstall
 
@@ -276,8 +278,9 @@ before installation.
   full-text mode available.
 - If the game version or source fingerprint changes between generation and
   install, stop and request regeneration before touching game files.
-- Reject incomplete language pairs, missing converter, malformed CSV, duplicate
-  records that cannot be paired unambiguously, and any failed converter exit.
+- Reject incomplete language pairs, malformed native structures or CSV,
+  duplicate records that cannot be paired unambiguously, and any failed
+  external-converter exit.
 - Disable install until staging and validation complete.
 - Prevent simultaneous operations on the same installation.
 - Report permission, disk-space, converter, backup, hash-conflict, and rollback
@@ -326,10 +329,11 @@ before installation.
 
 ## Verification approach
 
-Before enabling generation, validate the configured converter against copies of
-the selected installation's source resources and compare a decode/re-encode
-round trip. Disable generation when that check fails. During implementation, verify the merge behavior
-with representative converter CSV inputs, exercise the GUI against the known
+Before enabling generation, validate the selected backend against copies of
+the selected installation's source resources and compare decode/encode/decode
+semantic structures, including exact embedded newline code points. Disable
+generation when that check fails. During implementation, verify the native
+merge behavior and external-converter CSV path, exercise the GUI against the known
 game directory, and perform an install/modify/uninstall cycle against an
 isolated copied fixture rather than the live game. Confirm backup and installed
 hashes and inspect the exact target-file inventory before any live install.
@@ -352,3 +356,22 @@ packaging decision can bundle the Python app and local converter into a
 distributable Windows executable; the first implementation may be launched
 from the local Python environment. Do not package or redistribute a third-party
 converter without its author's permission.
+
+## Format 164 codec update
+
+After reviewing available Remastered format tooling, the user approved using
+an in-process codec based on the MIT-licensed low-level reader/writer in
+`0x7A2C9E5D/Witcher3StringEditor` at commit
+`a2baff84f53241a18a2ddd776aeb1c1ec1863560`. The Python app should use its own
+standard-library implementation by default for verified container formats
+162, 163, and 164. Format 164 text must decode as strict UTF-8; malformed input,
+unknown language metadata, or structures the codec cannot preserve must fail
+closed. Preserve every string entry, every localization-key association, and
+text code points including embedded CR, LF, and CRLF. Do not route native
+records through line-oriented CSV.
+
+The configured external converter remains an explicit override for users who
+need it. Native compatibility checks must decode, encode, and decode isolated
+copies, then compare the full semantic record structure and exact text. The
+game directory remains read-only during generation probes. Dialogue-only
+classification and install lifecycle rules are unchanged.

@@ -4,9 +4,9 @@
 
 **Goal:** Build a Windows GUI that creates, installs, modifies, and uninstalls a version-aware dual-language subtitle update for The Witcher 3: Wild Hunt — Remastered 5.00.
 
-**Architecture:** Keep the existing Python project and default to its local `w3strings.exe`; let the user select a compatible executable when needed. Split the current script into focused game discovery, conversion, merge, generation, install, and GUI modules. Store backups and generation metadata under the user's local application data, discover Steam/GOG/Epic installs from registry and storefront records, and only enable dialogue-only mode when a build-matched context index can be verified.
+**Architecture:** Keep the existing Python project and use a built-in standard-library codec for verified `.w3strings` formats 162–164; let the user select a compatible external executable as an explicit override. Split the current script into focused game discovery, conversion, merge, generation, install, and GUI modules. Store backups and generation metadata under the user's local application data, discover Steam/GOG/Epic installs from registry and storefront records, and only enable dialogue-only mode when a build-matched context index can be verified.
 
-**Tech Stack:** Python 3.10+, standard-library Tkinter, `subprocess`, `winreg`, JSON, SHA-256, and the existing `w3strings.exe` v0.4.1 as the default converter. Since v0.4.1 cannot read Remastered format 164, generation requires a user-configured compatible executable until the default supports it. Use Python's `unittest` for isolated module checks and copied game fixtures; no third-party runtime dependency is introduced.
+**Tech Stack:** Python 3.10+, standard-library Tkinter, `subprocess`, `winreg`, JSON, SHA-256, a native format 162–164 codec, and the existing executable as an optional external converter. Use Python's `unittest` for isolated module checks and copied game fixtures; no third-party runtime dependency is introduced.
 
 **Spec:** `docs/superpowers/specs/2026-10-03-witcher3-dual-subtitle-manager-design.md`
 
@@ -15,7 +15,7 @@
 - Target Windows and The Witcher 3: Wild Hunt — Remastered 5.00.
 - Accept the game executable under `bin\x64` or `bin\x64_dx12`; reject unsupported major/minor versions.
 - Discover Steam, GOG, and Epic installations; validate candidates and allow manual browsing. Require `content` and a supported executable; scan `dlc` only when present and never treat `dlc-tombstones` as active resources.
-- Use standard-library Tkinter and default to the local `w3strings.exe`; allow configuration of a compatible converter executable, and do not add a GUI runtime dependency or redistribute a third-party converter.
+- Use standard-library Tkinter and the built-in format 162–164 codec by default; allow configuration of a compatible external converter override, and do not add a GUI runtime dependency or redistribute a third-party converter.
 - Store staging data, generation records, and backups outside the game directory under local application data, keyed by normalized game path.
 - Never use the game directory as scratch space or recursively delete game paths.
 - Pair resources and records by relative path, string ID, and key; keep primary text first and retain primary-only records.
@@ -30,6 +30,7 @@
 - Remastered executable layouts and game upgrades that change language assets while version metadata stays the same, or change only version metadata — Tasks 2 and 5 must assert version detection and freshness decisions.
 - Dialogue IDs used by multiple resource contexts, overhead/oneliner IDs, and unknown IDs — Task 4 must assert only confirmed in-scene subtitle IDs are eligible.
 - CSV text containing delimiters and `<br>` markers, missing or duplicate records, malformed input, and converter failures — Task 3 must assert safe parsing and fail-closed conversion.
+- Native codec preservation of all localization-key associations, strict v164 UTF-8 decoding, and exact embedded newline code points — Task 9 must assert semantic round trips and structured merging without CSV serialization.
 - Third-party edits, locked files, and failures after only part of a replacement set was installed — Task 6 must assert conflict detection and exact rollback behavior.
 
 ---
@@ -305,3 +306,30 @@ class GenerationRecord:
 
 - [x] **Step 4: Manually scan the live F: game folder** without installing; confirm version, languages, converter result, storefront label, and exact file inventory. Only install to the live game in a separate user-authorized action.
 - [x] **Step 5: Commit** `docs: describe dual subtitle manager workflow`.
+
+### Task 9: Native Remastered `.w3strings` codec
+
+**Files:**
+- Create: `w3sub_app/w3strings_native.py`
+- Create: `w3sub_app/third_party/w3strings_codec/LICENSE`
+- Create: `w3sub_app/third_party/w3strings_codec/NOTICE.md`
+- Modify: `w3sub_app/merge.py`
+- Modify: `w3sub_app/converter.py`
+- Modify: `w3sub_app/generation.py`
+- Modify: `w3sub_app/models.py`
+- Modify: `w3sub_app/gui.py`
+- Create: `tests/test_w3strings_native.py`
+- Modify: `tests/test_merge.py`, `tests/test_generation.py`, `tests/test_gui.py`, `tests/test_workflow.py`, `README.md`
+
+**Design:** Add a built-in Python codec based on the MIT-licensed W3Strings reader/writer audited from `0x7A2C9E5D/Witcher3StringEditor` at commit `a2baff84f53241a18a2ddd776aeb1c1ec1863560`. Preserve all text entries and localization-key associations. Support only verified container generations 162, 163, and 164; decode UTF-8 strictly for v164. Merge structured records without serializing text through the line-oriented CSV path, so CR, LF, and CRLF survive exactly. Keep the configured external converter as an optional legacy override, and make the built-in codec the default. Continue to gate generation on a semantic decode/encode/decode check over isolated source copies.
+
+**Plan/spec reconciliation:** This approved codec update supersedes the initial converter-default wording in the original design and earlier plan tasks. Earlier tasks retain their tested external CSV path; Task 9 adds the built-in codec path and changes the GUI default. The MIT source is attribution only; no .NET or third-party runtime is added.
+
+- [x] **Step 1: Add codec and structured-merge tests first.** Use small synthetic binary fixtures with known bytes for formats 162/163/164, Unicode, duplicate key associations, and embedded CR/LF. Assert corrupt or unsupported data fails closed and decoded semantic records survive an encode round trip exactly.
+- [x] **Step 2: Implement the codec.** Preserve container version, language key, every string ID/text, and every `(key hash, string ID)` association. Reject duplicate/invalid structure or unsupported language keys rather than dropping data. Carry the upstream MIT license and attribution notice.
+- [x] **Step 3: Add a structured merge seam.** Match by string ID and shared localization-key hash, append the secondary text with `<br>`, preserve primary-only entries and all primary key associations, and leave the existing CSV path covered for external converters.
+- [x] **Step 4: Integrate native compatibility and generation.** Compare semantic structures directly (including exact newline code points), probe only copied inputs, and record the codec implementation identity/hash with each generation. Preserve external converter selection as an explicit override.
+- [x] **Step 5: Make the built-in codec the GUI default.** Keep a clear status/readiness message and allow an external converter only when explicitly selected. Do not weaken dialogue-only gating or install safety.
+- [x] **Step 6: Verify using a copied real v164 resource.** Copy representative files from the live install into a temporary directory and test decode/encode/decode and generation there; never call install/modify/uninstall on the live game.
+- [x] **Step 7: Run focused/full suites, `py_compile`, and `git diff --check`;** update README with actual codec requirements and limitations.
+- [x] **Step 8: Fresh independent review and commit** `feat: support Remastered w3strings format 164`.
