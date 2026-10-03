@@ -45,6 +45,29 @@ class FixtureConverter:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_native_binary_lifecycle_restores_exact_originals_in_copied_fixture(self):
+        from w3sub_app.w3strings_native import StringsFile, encode, decode
+        for path in self.game_root.rglob("*.w3strings"):
+            path.write_bytes(encode(StringsFile(164, 0, ((1, path.stem + "\r\ntext\n\r"),), ((7, 1), (8, 1)))))
+        game = self._scan()
+        originals = self._original_bytes()
+        record = generate(self._request(game), self.state_root)
+        self.assertEqual(record.codec_kind, "native")
+        with patch.object(install, "_running_game_processes", return_value=()):
+            manifest = install.install_generation(game, record, self.state_root)
+            for relative in manifest.target_files:
+                self.assertEqual(decode((game.root / relative).read_bytes()).strings,
+                                 ((1, "en\r\ntext\n\r<br>zh\r\ntext\n\r"),))
+            overrides = {relative: target.backup_path for relative, target in manifest.target_files.items()}
+            changed_pair = generate(self._request(game, "zh", "en", overrides), self.state_root)
+            modified = install.modify_install(game, changed_pair, manifest)
+            for relative in modified.target_files:
+                self.assertEqual(decode((game.root / relative).read_bytes()).strings,
+                                 ((1, "zh\r\ntext\n\r<br>en\r\ntext\n\r"),))
+            restored = install.uninstall(game, modified)
+        self.assertEqual(restored.conflicts, ())
+        self.assertEqual(self._original_bytes(), originals)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="workflow acceptance ")
         self.addCleanup(self.temp.cleanup)

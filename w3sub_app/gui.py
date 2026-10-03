@@ -12,12 +12,19 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import config, generation, install, storefronts
 from .converter import CompatibilityReport, W3StringsConverter, check_compatibility
+from .w3strings_native import NativeW3StringsCodec
 from .dialogue_index import dialogue_index_unavailable_reason
 from .game import scan_game
 from .models import (
     AppConfig, Freshness, GameCandidate, GameInstallation, GenerationRecord,
     GenerationRequest, InstallComparison, InstallManifest, MergeMode, Storefront,
 )
+
+
+def selected_converter(selection: str):
+    """An empty selection uses the built-in codec; paths explicitly override it."""
+    return (NativeW3StringsCodec() if selection.strip() in ("", "builtin")
+            else W3StringsConverter(Path(selection).expanduser().resolve()))
 
 
 @dataclass(frozen=True)
@@ -332,7 +339,7 @@ class W3DualSubtitleApp:
         self.logger = config.configure_logging()
         self.app_config = app_config or config.load_config()
         self.app_root = config.app_state_root().resolve()
-        self.converter_path = self.app_config.converter_path or default_converter_path()
+        self.converter_path = self.app_config.converter_path
         self._messages: queue.Queue = queue.Queue()
         self._busy = False
         self._progress_running = False
@@ -366,13 +373,15 @@ class W3DualSubtitleApp:
         self.game_details_var = tk.StringVar(value="Scanning storefront records…")
         ttk.Label(frame, textvariable=self.game_details_var, wraplength=780).grid(
             row=1, column=0, columnspan=3, sticky="ew", pady=(0, 5))
-        ttk.Label(frame, text="Converter executable").grid(row=2, column=0, sticky="w")
-        self.converter_var = tk.StringVar(value=str(self.converter_path))
+        ttk.Label(frame, text="Codec / external override").grid(row=2, column=0, sticky="w")
+        self.converter_var = tk.StringVar(value=str(self.converter_path) if self.converter_path else "builtin")
         self.converter_entry = ttk.Entry(frame, textvariable=self.converter_var)
         self.converter_entry.configure(state="readonly")
         self.converter_entry.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
         self.converter_button = ttk.Button(frame, text="Browse…", command=self._browse_converter)
         self.converter_button.grid(row=2, column=2, sticky="ew")
+        self.native_codec_button = ttk.Button(frame, text="Use built-in", command=self._use_native_codec)
+        self.native_codec_button.grid(row=2, column=3, sticky="ew", padx=(6, 0))
         self.converter_status_var = tk.StringVar(value="Compatibility has not been checked")
         ttk.Label(frame, textvariable=self.converter_status_var, wraplength=780).grid(
             row=3, column=0, columnspan=3, sticky="ew", pady=(0, 5))
@@ -505,7 +514,7 @@ class W3DualSubtitleApp:
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
-                       self.converter_button, self.primary_combo, self.secondary_combo,
+                       self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
                        self.full_mode, self.dialogue_mode, self.rescan_button):
             try:
                 widget.configure(state=state)
@@ -695,6 +704,15 @@ class W3DualSubtitleApp:
         self.converter_compatible = False
         self._run_compatibility_check()
 
+    def _use_native_codec(self):
+        self.converter_path = None
+        self.converter_var.set("builtin")
+        game_root = self.snapshot.selected.game.root if self.snapshot else self.app_config.last_game_root
+        self.app_config = AppConfig(game_root, None)
+        config.save_config(self.app_config)
+        self.converter_compatible = False
+        self._run_compatibility_check()
+
     def _pair_changed(self, _event=None):
         if self._busy:
             return
@@ -716,18 +734,14 @@ class W3DualSubtitleApp:
             return
         manifest = self.snapshot.manifest
         converter_raw = self.converter_var.get().strip()
-        if not converter_raw:
-            self.converter_status_var.set("Choose a w3strings converter executable")
-            return
-        converter_path = Path(converter_raw).expanduser().resolve()
 
         def operation():
-            converter = W3StringsConverter(converter_path)
+            converter = selected_converter(converter_raw)
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             return check_pair_compatibility(game, primary, secondary, converter,
                                             self.app_root, overrides or None)
 
-        self.converter_status_var.set("Checking selected resource copies with the converter…")
+        self.converter_status_var.set("Checking selected resource copies with the selected codec…")
         self._submit("converter compatibility check", operation, self._compatibility_checked)
 
     def _compatibility_checked(self, report: CompatibilityReport):
@@ -827,12 +841,12 @@ class W3DualSubtitleApp:
             return
         primary, secondary = self.primary_var.get(), self.secondary_var.get()
         mode = MergeMode(self.mode_var.get())
-        converter_path = Path(self.converter_var.get().strip())
+        converter_raw = self.converter_var.get().strip()
 
         def operation():
             game, _state, manifest, _comparison = self._fresh_game_and_manifest()
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
-            converter = W3StringsConverter(converter_path)
+            converter = selected_converter(converter_raw)
             compatibility = check_pair_compatibility(
                 game, primary, secondary, converter, self.app_root, overrides or None,
             )

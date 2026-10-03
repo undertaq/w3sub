@@ -29,9 +29,13 @@ Full-text mode processes all matching records in the selected resources. Without
 
 **Dialogue only** remains disabled until a validated structured dialogue-reference index exists for the detected game build. The app will not guess from wording, record IDs alone, or subtitle-like text.
 
-Before enabling generation, the app runs the selected converter against copies of all resources in the language pair and checks that records survive a decode/encode round trip. The bundled `w3strings.exe` v0.4.1 supports resource formats 162–163; the local Remastered 5.00 resources use format 164, which that bundled converter cannot read. On that installation the compatibility check fails and generation stays disabled. You can use **Browse** to configure a compatible converter executable you already have. The project does not download or bundle an unofficial converter.
+The **built-in codec** is the default and requires only the Python standard library. It supports verified formats **162–163 (UTF-16LE)** and **164 (strict UTF-8)**. Before enabling generation, the app checks copies of every selected resource through decode/encode/decode, comparing container version, language key, every string ID and text, and every localization-key association. Generation repeats this gate over isolated copies. Embedded CR, LF, and CRLF text is preserved exactly through structured merging. Unknown formats or language keys, invalid Unicode, duplicate string IDs, and exact repeated key associations fail closed.
 
-Once compatibility passes, choose **Generate preview**. Generated files and a record of the selected pair, game version, input hashes, converter, and output hashes are written to application data, outside the game folder. Review the exact target paths and hashes shown by the GUI before continuing.
+Native merging requires the same string ID and a shared actual localization-key hash. Strings without key associations remain primary-only. All primary associations survive, including distinct hashes for one ID and references to IDs stored in other resources. Dialogue-only changes additionally require every primary association for that string to be verified as a scene subtitle by a current index.
+
+Use **Browse** beside the codec selection to explicitly choose an external executable for the legacy CSV path, or **Use built-in** to clear that saved override. The external path retains its line-oriented CSV limitations for embedded line breaks. The old `w3strings.exe` v0.4.1 supports only formats 162–163 and will fail compatibility checks on format 164. No converter download, .NET runtime, or third-party Python dependency is required. Codec attribution and the upstream MIT license are in `w3sub_app/third_party/w3strings_codec/`.
+
+Once compatibility passes, choose **Generate preview**. Generated files and a record of the selected pair, game version, input hashes, codec kind, implementation path/version/SHA-256 (or external converter identity), and output hashes are written to application data, outside the game folder. Review the exact target paths and hashes shown by the GUI before continuing.
 
 ## Install, modify, and uninstall
 

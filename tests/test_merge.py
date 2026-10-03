@@ -7,6 +7,39 @@ from w3sub_app.merge import MergeError, merge_csv
 from w3sub_app.models import GameInstallation, GameVersion, MergeMode, Storefront
 
 
+class NativeMergeTests(unittest.TestCase):
+    def test_matches_shared_real_keys_and_preserves_all_primary_associations(self):
+        from w3sub_app.merge import merge_records
+        from w3sub_app.w3strings_native import StringsFile
+        primary = StringsFile(164, 0, ((1, "a\r\nb"), (2, "unkeyed"), (3, "different")),
+                              ((10, 1), (11, 1), (12, 3), (99, 90)))
+        secondary = StringsFile(163, 0, ((1, "中\n文\r"), (2, "other"), (3, "other")),
+                                ((11, 1), (13, 3)))
+        result = merge_records(primary, secondary, MergeMode.FULL_TEXT)
+        self.assertEqual(result.strings, ((1, "a\r\nb<br>中\n文\r"), (2, "unkeyed"), (3, "different")))
+        self.assertEqual(result.keys, primary.keys)
+        self.assertEqual(result.version, 164)
+        self.assertEqual(result.language_key, 0)
+        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY), primary)
+
+    def test_dialogue_mode_requires_all_primary_associations_to_be_scene_subtitles(self):
+        from w3sub_app.merge import merge_records
+        from w3sub_app.w3strings_native import StringsFile
+        game = GameInstallation(Path("game"), Storefront.STEAM, GameVersion("5.0", None), {})
+        class Index:
+            validated = True
+            def is_current(self, current):
+                return current == game
+            def context_for(self, string_id, key):
+                return DialogContext.SCENE_SUBTITLE if key == "a" else DialogContext.UNKNOWN
+        primary = StringsFile(164, 0, ((1, "text"),), ((10, 1), (11, 1)))
+        secondary = StringsFile(164, 0, ((1, "other"),), ((10, 1),))
+        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, Index(), game), primary)
+        single = StringsFile(164, 0, primary.strings, ((10, 1),))
+        self.assertEqual(merge_records(single, secondary, MergeMode.DIALOGUE_ONLY, Index(), game).strings,
+                         ((1, "text<br>other"),))
+
+
 class MergeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="merge space ")

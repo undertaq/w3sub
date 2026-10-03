@@ -69,6 +69,27 @@ class ExpiringDialogueIndex(FakeDialogueIndex):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_default_native_generation_preserves_newlines_and_codec_identity(self):
+        from w3sub_app.w3strings_native import StringsFile, decode, encode
+        for language in ("en", "zh"):
+            for path in self.game.language_files[language]:
+                Path(path).write_bytes(encode(StringsFile(164, 0, ((1, language + "\r\n中\n\r"),), ((7, 1), (8, 1)))))
+        before = {p: Path(p).read_bytes() for paths in self.game.language_files.values() for p in paths}
+        record = generate(GenerationRequest(self.game, "en", "zh", MergeMode.FULL_TEXT), self.state_root)
+        for output in record.output_files.values():
+            result = decode(Path(output).read_bytes())
+            self.assertEqual(result.strings, ((1, "en\r\n中\n\r<br>zh\r\n中\n\r"),))
+            self.assertEqual(result.keys, ((7, 1), (8, 1)))
+        self.assertEqual(record.codec_kind, "native")
+        self.assertEqual(record.converter_sha256, hashlib.sha256(Path(record.converter_path).read_bytes()).hexdigest())
+        self.assertEqual(generation.load_latest_generation_record(self.state_root, self.game.root), record)
+        self.assertTrue(all(Path(p).read_bytes() == data for p, data in before.items()))
+
+    def test_default_native_generation_rejects_corrupt_resource(self):
+        request = GenerationRequest(self.game, "en", "zh", MergeMode.FULL_TEXT)
+        with self.assertRaisesRegex(GenerationError, "compatibility"):
+            generate(request, self.state_root)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="generation ")
         self.addCleanup(self.temp.cleanup)

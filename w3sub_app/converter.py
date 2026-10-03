@@ -7,6 +7,7 @@ import tempfile
 from pathlib import PurePosixPath, PureWindowsPath
 
 from .merge import MergeError, _Record, _read_csv
+from .w3strings_native import NativeW3StringsCodec
 
 
 class ConverterError(RuntimeError):
@@ -66,10 +67,12 @@ def check_compatibility(sources: dict[str, Path], converter,
                 try:
                     resource_dir.mkdir(parents=True, exist_ok=False)
                     shutil.copyfile(original, staged)
-                    decoded = Path(converter.decode(staged, resource_dir / "decode-original"))
+                    decoded = converter.decode(staged, resource_dir / "decode-original")
                     encoded = Path(converter.encode(decoded, resource_dir / "encode"))
-                    roundtrip = Path(converter.decode(encoded, resource_dir / "decode-roundtrip"))
-                    if _semantic_records(decoded) != _semantic_records(roundtrip):
+                    roundtrip = converter.decode(encoded, resource_dir / "decode-roundtrip")
+                    before = decoded if isinstance(converter, NativeW3StringsCodec) else _semantic_records(Path(decoded))
+                    after = roundtrip if isinstance(converter, NativeW3StringsCodec) else _semantic_records(Path(roundtrip))
+                    if before != after:
                         raise ConverterError(
                             "semantic records changed during decode/encode/decode round-trip"
                         )

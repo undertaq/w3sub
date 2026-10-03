@@ -85,6 +85,7 @@ class GenerationRecord:
     app_version: str
     output_files: dict[str, str]
     output_hashes: dict[str, str]
+    codec_kind: str = "external"
 
 
 @dataclass(frozen=True)

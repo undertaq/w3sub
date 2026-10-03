@@ -5,9 +5,12 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import tempfile
 import uuid
+import shutil
 
 from .dialogue_index import load_dialogue_index
-from .merge import MergeError, merge_csv
+from .merge import MergeError, merge_csv, merge_records
+from .converter import check_compatibility
+from .w3strings_native import NativeW3StringsCodec
 from .models import (
     Freshness,
     GameInstallation,
@@ -199,6 +202,7 @@ def _fingerprint_payload(fingerprint: ResourceFingerprint) -> dict[str, object]:
 def _record_payload(record: GenerationRecord) -> dict[str, object]:
     return {
         "schema_version": GENERATION_RECORD_SCHEMA,
+        "codec_kind": record.codec_kind,
         "generation_id": record.generation_id,
         "game_root": str(record.game_root),
         "generation_dir": str(record.generation_dir),
@@ -218,8 +222,11 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
     }
 
 
-def generate(request: GenerationRequest, state_root: Path, converter) -> GenerationRecord:
+def generate(request: GenerationRequest, state_root: Path, converter=None) -> GenerationRecord:
     """Generate into per-game app state and atomically publish its JSON record."""
+    if converter is None:
+        converter = NativeW3StringsCodec()
+    native = isinstance(converter, NativeW3StringsCodec)
     if not isinstance(request.mode, MergeMode):
         raise GenerationError(f"Unsupported merge mode: {request.mode!r}")
     if (not isinstance(request.primary_language, str)
@@ -272,13 +279,25 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
     try:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
             scratch = Path(scratch_name)
+            if native:
+                copied_sources = {}
+                for number, (relative, source) in enumerate(sorted(sources.items())):
+                    copied = scratch / "inputs" / str(number) / Path(relative).name
+                    copied.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, copied)
+                    copied_sources[relative] = copied
+                report = check_compatibility(copied_sources, converter, scratch / "compatibility")
+                if not report.compatible:
+                    raise GenerationError(f"Native codec compatibility check failed: {report.error}")
+            else:
+                copied_sources = sources
             for number, (_, primary_relative, secondary_relative) in enumerate(pairs):
-                primary_csv = converter.decode(sources[primary_relative],
+                primary_csv = converter.decode(copied_sources[primary_relative],
                                                scratch / f"{number}-primary")
-                secondary_csv = converter.decode(sources[secondary_relative],
+                secondary_csv = converter.decode(copied_sources[secondary_relative],
                                                  scratch / f"{number}-secondary")
                 try:
-                    merged_csv = merge_csv(
+                    merged_csv = (merge_records if native else merge_csv)(
                         primary_csv,
                         secondary_csv,
                         request.mode,
@@ -329,6 +348,7 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
             app_version=APP_VERSION,
             output_files=output_files,
             output_hashes=output_hashes,
+            codec_kind="native" if native else "external",
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -346,6 +366,8 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
 def _record_from_payload(payload: object) -> GenerationRecord:
     if not isinstance(payload, dict) or payload.get("schema_version") != GENERATION_RECORD_SCHEMA:
         raise ValueError("unsupported generation record schema")
+    if payload.get("codec_kind", "external") not in ("native", "external"):
+        raise ValueError("unsupported generation codec kind")
     version = payload.get("game_version")
     fingerprint = payload.get("source_fingerprint")
     if not isinstance(version, dict) or not isinstance(fingerprint, dict):
@@ -406,6 +428,7 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         app_version=payload["app_version"],
         output_files=dict(output_files),
         output_hashes=dict(output_hashes),
+        codec_kind=payload.get("codec_kind", "external"),
     )
     return record
 

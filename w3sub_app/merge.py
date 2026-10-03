@@ -7,6 +7,45 @@ from typing import Protocol
 
 from .dialogue_index import DialogContext
 from .models import GameInstallation, MergeMode
+from .w3strings_native import StringsFile
+
+
+def merge_records(primary: StringsFile, secondary: StringsFile, mode: MergeMode,
+                  dialogue_index=None, current_game=None) -> StringsFile:
+    """Merge by ID and a real shared hash; retain all primary key references."""
+    if not isinstance(mode, MergeMode):
+        raise MergeError(f"Unsupported merge mode: {mode}")
+    primary_keys = {}
+    secondary_keys = {}
+    for key_hash, string_id in primary.keys:
+        primary_keys.setdefault(string_id, set()).add(key_hash)
+    for key_hash, string_id in secondary.keys:
+        secondary_keys.setdefault(string_id, set()).add(key_hash)
+    other_texts = dict(secondary.strings)
+    current = False
+    if (mode is MergeMode.DIALOGUE_ONLY and current_game is not None
+            and getattr(dialogue_index, "validated", False) is True):
+        try:
+            current = dialogue_index.is_current(current_game) is True
+        except Exception:
+            pass
+    strings = []
+    for string_id, text in primary.strings:
+        keys = primary_keys.get(string_id, set())
+        shared = keys & secondary_keys.get(string_id, set())
+        combine = bool(shared) and string_id in other_texts
+        if combine and mode is MergeMode.DIALOGUE_ONLY:
+            # One string can serve several contexts; every primary association
+            # must be verified as a subtitle before changing its shared text.
+            combine = current
+            if combine:
+                try:
+                    combine = all(dialogue_index.context_for(str(string_id), format(key, "x"))
+                                  is DialogContext.SCENE_SUBTITLE for key in keys)
+                except Exception:
+                    combine = False
+        strings.append((string_id, text + "<br>" + other_texts[string_id] if combine else text))
+    return StringsFile(primary.version, primary.language_key, tuple(strings), primary.keys)
 
 
 class MergeError(RuntimeError):

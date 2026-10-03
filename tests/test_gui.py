@@ -3,6 +3,33 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+
+
+class NativeSelectionTests(unittest.TestCase):
+    def test_reset_to_native_clears_persisted_external_override(self):
+        from types import SimpleNamespace
+        from w3sub_app.gui import W3DualSubtitleApp
+        from w3sub_app.models import AppConfig
+        value = []
+        checked = []
+        app = SimpleNamespace(snapshot=None, app_config=AppConfig(None, Path("external.exe")),
+                              converter_var=SimpleNamespace(set=value.append),
+                              _run_compatibility_check=lambda: checked.append(True))
+        with patch("w3sub_app.gui.config.save_config") as save:
+            W3DualSubtitleApp._use_native_codec(app)
+        self.assertIsNone(app.converter_path)
+        self.assertIsNone(app.app_config.converter_path)
+        self.assertEqual(value, ["builtin"])
+        self.assertEqual(checked, [True])
+        save.assert_called_once_with(AppConfig())
+
+    def test_builtin_is_default_and_external_requires_selection(self):
+        from w3sub_app.gui import selected_converter
+        from w3sub_app.converter import W3StringsConverter
+        from w3sub_app.w3strings_native import NativeW3StringsCodec
+        self.assertIsInstance(selected_converter(""), NativeW3StringsCodec)
+        self.assertIsInstance(selected_converter("builtin"), NativeW3StringsCodec)
+        self.assertIsInstance(selected_converter("custom.exe"), W3StringsConverter)
 from unittest.mock import patch
 
 import w3sub_app.gui as gui_module
