@@ -284,6 +284,32 @@ class GenerationTests(unittest.TestCase):
         )
         self.assertEqual(compare_generation(mismatched_record, self.game), Freshness.STALE)
 
+    def test_partial_output_inventory_cannot_pass_as_a_complete_generation(self):
+        extra_primary = self.write_language("en", "content/dlc0")
+        extra_secondary = self.write_language("zh", "content/dlc0")
+        game = GameInstallation(
+            self.game.root,
+            self.game.storefront,
+            self.game.version,
+            {
+                "en": (*self.game.language_files["en"], extra_primary),
+                "zh": (*self.game.language_files["zh"], extra_secondary),
+            },
+        )
+        record = generate(self.request(game=game), self.state_root, self.converter)
+        self.assertEqual(len(record.output_files), 2)
+
+        missing_target = "content/dlc0/en.w3strings"
+        partial_record = replace(
+            record,
+            output_files={key: path for key, path in record.output_files.items()
+                          if key != missing_target},
+            output_hashes={key: digest for key, digest in record.output_hashes.items()
+                           if key != missing_target},
+        )
+
+        self.assertEqual(compare_generation(partial_record, game), Freshness.STALE)
+
     def test_game_or_source_update_after_generation_is_detected_before_install(self):
         record = generate(self.request(), self.state_root, self.converter)
         same_assets_new_build = GameInstallation(

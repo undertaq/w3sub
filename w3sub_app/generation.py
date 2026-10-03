@@ -385,7 +385,15 @@ def _safe_relative_output(relative: str) -> tuple[str, ...] | None:
 
 
 def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
-    if not record.output_files or record.output_files.keys() != record.output_hashes.keys():
+    expected_outputs = {
+        relative
+        for relative in record.source_fingerprint.entries
+        if (PurePosixPath(relative).suffix.casefold() == ".w3strings"
+            and PurePosixPath(relative).stem.casefold() == record.primary_language.casefold())
+    }
+    if (not expected_outputs
+            or set(record.output_files) != expected_outputs
+            or record.output_files.keys() != record.output_hashes.keys()):
         return False
     generation_dir = _generation_directory(record, game_root)
     if generation_dir is None:
