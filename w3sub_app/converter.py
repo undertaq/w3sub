@@ -1,12 +1,83 @@
 """Run the bundled converter on isolated staging copies."""
 from pathlib import Path
+from dataclasses import dataclass
 import shutil
 import subprocess
 import tempfile
+from pathlib import PurePosixPath, PureWindowsPath
+
+from .merge import MergeError, _Record, _read_csv
 
 
 class ConverterError(RuntimeError):
     """Conversion failed; no output may be used."""
+
+
+@dataclass(frozen=True)
+class CompatibilityReport:
+    compatible: bool
+    checked_resources: int
+    error: str | None = None
+
+
+def _semantic_records(path: Path) -> tuple[tuple[tuple[str, str], str, str], ...]:
+    rows = _read_csv(path)
+    records = []
+    for row in rows:
+        if isinstance(row, _Record):
+            key_string = row.prefix.split("|", 3)[2]
+            records.append((row.identity, key_string, row.text))
+    return tuple(sorted(records))
+
+
+def check_compatibility(sources: dict[str, Path], converter,
+                        work_dir: Path) -> CompatibilityReport:
+    """Probe every selected resource by round-tripping isolated copies.
+
+    Comparing parsed records ignores harmless comment/line-ending changes but
+    requires identity, key-string metadata, and localized text to survive.
+    A failed resource blocks the whole inventory; all resources are attempted
+    so the UI can present the converter's complete actionable diagnostics.
+    """
+    if not isinstance(sources, dict) or not sources:
+        return CompatibilityReport(False, 0, "No selected language resources to check")
+    inventory = []
+    for relative, raw_path in sorted(sources.items()):
+        if not isinstance(relative, str) or not relative:
+            return CompatibilityReport(False, 0, "Resource inventory contains an invalid path")
+        posix, windows = PurePosixPath(relative), PureWindowsPath(relative)
+        if (posix.is_absolute() or windows.is_absolute() or windows.drive
+                or ".." in posix.parts or "." in posix.parts
+                or posix.as_posix() != relative or "\\" in relative
+                or posix.suffix.casefold() != ".w3strings"):
+            return CompatibilityReport(False, 0,
+                                       f"Unsafe resource path in compatibility inventory: {relative}")
+        inventory.append((relative, Path(raw_path)))
+
+    work_dir = Path(work_dir).expanduser().resolve()
+    errors = []
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="compatibility-", dir=work_dir) as probe_name:
+            probe = Path(probe_name)
+            for number, (relative, original) in enumerate(inventory):
+                resource_dir = probe / f"resource-{number:04d}"
+                staged = resource_dir / Path(relative).name
+                try:
+                    resource_dir.mkdir(parents=True, exist_ok=False)
+                    shutil.copyfile(original, staged)
+                    decoded = Path(converter.decode(staged, resource_dir / "decode-original"))
+                    encoded = Path(converter.encode(decoded, resource_dir / "encode"))
+                    roundtrip = Path(converter.decode(encoded, resource_dir / "decode-roundtrip"))
+                    if _semantic_records(decoded) != _semantic_records(roundtrip):
+                        raise ConverterError(
+                            "semantic records changed during decode/encode/decode round-trip"
+                        )
+                except Exception as error:
+                    errors.append(f"{relative}: {error}")
+    except Exception as error:
+        errors.append(f"Cannot run converter compatibility check: {error}")
+    return CompatibilityReport(not errors, len(inventory), "\n".join(errors) if errors else None)
 
 
 class W3StringsConverter:

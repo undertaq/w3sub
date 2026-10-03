@@ -16,6 +16,7 @@ from .models import (
     GenerationRequest,
     MergeMode,
     ResourceFingerprint,
+    Storefront,
 )
 
 
@@ -340,6 +341,119 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
         raise
     except Exception as error:
         raise GenerationError(f"Generation failed: {error}") from error
+
+
+def _record_from_payload(payload: object) -> GenerationRecord:
+    if not isinstance(payload, dict) or payload.get("schema_version") != GENERATION_RECORD_SCHEMA:
+        raise ValueError("unsupported generation record schema")
+    version = payload.get("game_version")
+    fingerprint = payload.get("source_fingerprint")
+    if not isinstance(version, dict) or not isinstance(fingerprint, dict):
+        raise ValueError("generation record version or fingerprint is malformed")
+    entries = fingerprint.get("entries")
+    if (not isinstance(entries, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in entries.items())):
+        raise ValueError("generation record source entries are malformed")
+    if any(not _is_sha256(value) for value in entries.values()):
+        raise ValueError("generation record contains an invalid source hash")
+    output_files, output_hashes = payload.get("output_files"), payload.get("output_hashes")
+    if (not isinstance(output_files, dict) or not isinstance(output_hashes, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str)
+                   for mapping in (output_files, output_hashes)
+                   for key, value in mapping.items())):
+        raise ValueError("generation record outputs are malformed")
+    if any(not _is_sha256(value) for value in output_hashes.values()):
+        raise ValueError("generation record contains an invalid output hash")
+    for name in ("generation_id", "game_root", "generation_dir", "converter_path", "app_version",
+                 "primary_language", "secondary_language"):
+        if not isinstance(payload.get(name), str) or not payload[name]:
+            raise ValueError(f"generation record {name} is malformed")
+    for name in ("converter_sha256", "converter_version", "classifier_digest"):
+        if payload.get(name) is not None and not isinstance(payload[name], str):
+            raise ValueError(f"generation record {name} is malformed")
+    if (not _is_sha256(payload.get("converter_sha256"))
+            or not isinstance(fingerprint.get("digest"), str)
+            or not _is_sha256(fingerprint.get("digest"))
+            or (payload.get("classifier_digest") is not None
+                and not _is_sha256(payload.get("classifier_digest")))
+            or not all(isinstance(version.get(name), (str, type(None)))
+                       for name in ("executable_version", "store_build_id", "executable_version_raw"))):
+        raise ValueError("generation record version or digest is malformed")
+    if (len(payload["generation_id"]) != 32
+            or any(character not in "0123456789abcdef" for character in payload["generation_id"])
+            or not Path(payload["generation_dir"]).is_absolute()
+            or not Path(payload["game_root"]).is_absolute()
+            or not Path(payload["converter_path"]).is_absolute()):
+        raise ValueError("generation record contains an unsafe id or path")
+    record = GenerationRecord(
+        generation_id=payload["generation_id"],
+        game_root=Path(payload["game_root"]),
+        generation_dir=Path(payload["generation_dir"]),
+        storefront=Storefront(payload["storefront"]),
+        game_version=GameVersion(
+            version["executable_version"], version.get("store_build_id"),
+            version.get("executable_version_raw"),
+        ),
+        primary_language=payload["primary_language"],
+        secondary_language=payload["secondary_language"],
+        mode=MergeMode(payload["mode"]),
+        source_fingerprint=ResourceFingerprint(dict(entries), fingerprint["digest"]),
+        classifier_digest=payload.get("classifier_digest"),
+        converter_path=payload["converter_path"],
+        converter_sha256=payload.get("converter_sha256"),
+        converter_version=payload.get("converter_version"),
+        app_version=payload["app_version"],
+        output_files=dict(output_files),
+        output_hashes=dict(output_hashes),
+    )
+    return record
+
+
+def _is_sha256(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value.lower()))
+
+
+def load_latest_generation_record(state_root: Path, game_root: Path) -> GenerationRecord | None:
+    """Load the newest well-formed generation for this exact game root."""
+    root = _normalized_game_root(game_root)
+    supplied_state = Path(state_root).expanduser().resolve()
+    generations = supplied_state / "games" / _game_root_hash(root) / "generations"
+    try:
+        generations.resolve(strict=True).relative_to(root)
+    except ValueError:
+        pass
+    except OSError:
+        return None
+    else:
+        raise GenerationError("Generation state must be outside the game folder")
+    try:
+        children = tuple(generations.iterdir())
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise GenerationError(f"Cannot inspect generation history: {error}") from error
+    candidates = []
+    for directory in children:
+        record_path = directory / "generation.json"
+        try:
+            if not directory.is_dir() or not record_path.is_file():
+                continue
+            if directory.resolve(strict=True) != directory:
+                continue
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            record = _record_from_payload(payload)
+            if (_normalized_game_root(record.game_root) != root
+                    or _generation_directory(record, root) != directory.resolve(strict=True)
+                    or not _verify_outputs(record, root)):
+                continue
+            candidates.append((record_path.stat().st_mtime_ns, record))
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _generation_directory(record: GenerationRecord, game_root: Path) -> Path | None:

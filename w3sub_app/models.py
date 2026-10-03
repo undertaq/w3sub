@@ -24,6 +24,12 @@ class Freshness(Enum):
 
 
 @dataclass(frozen=True)
+class AppConfig:
+    last_game_root: Path | None = None
+    converter_path: Path | None = None
+
+
+@dataclass(frozen=True)
 class GameCandidate:
     root: Path
     storefront: Storefront
