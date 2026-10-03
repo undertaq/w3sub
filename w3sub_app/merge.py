@@ -5,7 +5,8 @@ import re
 import tempfile
 from typing import Protocol
 
-from .models import MergeMode
+from .dialogue_index import DialogContext
+from .models import GameInstallation, MergeMode
 
 
 class MergeError(RuntimeError):
@@ -17,7 +18,10 @@ class DialogueIndex(Protocol):
 
     validated: bool
 
-    def context_for(self, string_id: str, key: str) -> object:
+    def is_current(self, game: GameInstallation) -> bool:
+        ...
+
+    def context_for(self, string_id: str, key: str) -> DialogContext:
         ...
 
 
@@ -60,14 +64,23 @@ def _read_csv(path: Path) -> list[str | _Record]:
 
 
 def merge_csv(primary: Path, secondary: Path, mode: MergeMode,
-              dialogue_index: DialogueIndex | None = None) -> Path:
+              dialogue_index: DialogueIndex | None = None,
+              current_game: GameInstallation | None = None) -> Path:
     """Create a separate CSV beside primary; callers pair resource paths first."""
     if not isinstance(mode, MergeMode):
         raise MergeError(f"Unsupported merge mode: {mode}")
-    if mode is MergeMode.DIALOGUE_ONLY and (
-            getattr(dialogue_index, "validated", False) is not True
-            or not callable(getattr(dialogue_index, "context_for", None))):
-        raise MergeError("Dialogue-only merge requires a validated dialogue index")
+    index_is_current = False
+    if (mode is MergeMode.DIALOGUE_ONLY
+            and getattr(dialogue_index, "validated", False) is True
+            and callable(getattr(dialogue_index, "context_for", None))
+            and current_game is not None):
+        is_current = getattr(dialogue_index, "is_current", None)
+        if callable(is_current):
+            try:
+                index_is_current = is_current(current_game) is True
+            except Exception:
+                # A stale or unreadable index is a primary-only result.
+                index_is_current = False
     primary = Path(primary)
     secondary = Path(secondary)
     primary_rows = _read_csv(primary)
@@ -81,9 +94,14 @@ def merge_csv(primary: Path, secondary: Path, mode: MergeMode,
         other = secondary_records.get(row.identity)
         combine = other is not None
         if combine and mode is MergeMode.DIALOGUE_ONLY:
-            assert dialogue_index is not None
-            context = dialogue_index.context_for(*row.identity)
-            combine = getattr(context, "name", None) == "SCENE_SUBTITLE"
+            combine = False
+            if index_is_current:
+                assert dialogue_index is not None
+                try:
+                    context = dialogue_index.context_for(*row.identity)
+                except Exception:
+                    context = DialogContext.UNKNOWN
+                combine = context is DialogContext.SCENE_SUBTITLE
         text = row.text + "<br>" + other.text if combine and other else row.text
         lines.append(row.prefix + text + row.newline)
     try:
