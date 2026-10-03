@@ -32,20 +32,22 @@ state or overwrite them.
 ## User flow
 
 1. Launch the desktop application.
-2. Find the default game folder from Windows/Steam registry data: read
-   `HKCU\Software\Valve\Steam\SteamPath`, falling back to
-   `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath` or
-   `HKLM\SOFTWARE\Valve\Steam\InstallPath`. Read the Steam client's
-   `steamapps/libraryfolders.vdf`, then locate App ID 292030's
-   `appmanifest_292030.acf` to resolve `installdir`. If more than one valid
-   installation is found, let the user select one. If registry-based discovery
-   fails, use a previously saved valid folder or ask the user to browse.
+2. Find installed game folders from Windows registry data and storefront
+   metadata for Steam, GOG, and Epic. Use Steam's registry path and library
+   metadata, GOG game/uninstall registry records, and Epic registry overrides
+   plus the launcher's install manifests. Validate all discovered folders and
+   deduplicate identical paths. If more than one valid installation is found,
+   let the user select one. If discovery fails, use a previously saved valid
+   folder or ask the user to browse.
 3. On startup, detect the selected game's version and scan its resources.
    Repeat detection and scanning immediately after the user selects another
    game folder. Show the detected version, language codes, converter status,
    and writable game/state locations.
 4. Select distinct primary and secondary languages from detected resources.
-   Select either full-text combination or the existing dialogue-only mode.
+   Select full-text combination or dialogue-only mode. Enable dialogue-only
+   mode only when a classifier index validated for this game version is
+   available; otherwise explain why it is unavailable and leave full-text mode
+   available.
 5. Generate to a staging directory and show progress and actionable errors.
    Persist a generation record beside the staged output with the detected game
    version and a fingerprint of all source resources used to generate it.
@@ -84,9 +86,15 @@ recommended for the first version.
 
 - `game_discovery`: validate the selected game root, identify the Remastered
   5.00 executable/layout, discover `.w3strings` language codes under `content`
-  and `dlc`, inventory corresponding resource paths, and locate candidate
-  Steam installs from registry values plus `libraryfolders.vdf` and app
-  manifests.
+  and `dlc`, and inventory corresponding resource paths.
+- `dialogue_classifier`: load or build a versioned map from localization IDs to
+  their usage context in structured game resources. Classify in-dialogue scene
+  subtitles separately from overhead/oneliner text, item names, HUD/UI text,
+  objectives, and other strings. Enable dialogue-only mode only after this map
+  is validated for the selected game build.
+- `storefront_discovery`: read registry locations and each storefront's local
+  install records, return validated game-root candidates with a storefront
+  label, and deduplicate candidates that resolve to the same directory.
 - `converter`: invoke the bundled `w3strings.exe` with an argument list (never
   a shell command), capture output/exit status, and report decode/encode errors.
 - `merger`: read the converter's CSV representation, pair records by string ID
@@ -111,6 +119,21 @@ never used as scratch space.
 - Discover languages from actual language-named `.w3strings` assets in the
   selected installation. Only offer a language when usable resources for it
   are found; primary and secondary must differ.
+- Discover storefront candidates from both registry and store-owned metadata:
+  - Steam: read the client path from Steam registry values, inspect
+    `steamapps/libraryfolders.vdf`, and resolve App ID 292030 through its
+    `appmanifest_292030.acf`.
+  - GOG: inspect GOG game registry records and Windows uninstall entries for
+    The Witcher 3, checking both 32-bit and 64-bit machine and user registry
+    views where available.
+  - Epic: inspect Epic launcher registry data and per-game install-location
+    overrides, and parse the launcher's game install manifests (normally under
+    `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests`). Epic manifests
+    are required because registry data may not contain each game's install
+    location.
+- Validate each candidate using the game's executable/version and required
+  resource layout. Ignore stale entries and allow manual browsing if discovery
+  does not produce a valid folder. Do not scan every drive by default.
 - Walk matching primary and secondary resource paths in `content` and `dlc`.
 - Match CSV records by both string ID and key, preserving source ordering and
   comments where the converter format supports them.
@@ -121,11 +144,22 @@ never used as scratch space.
   language is the destination resource and has no corresponding primary
   translation to pair.
 - The default full-text mode applies the dual-line format to all matched
-  records. Dialogue-only mode preserves the existing primary-only behavior for
-  short strings not ending in the legacy dialogue punctuation set, while
-  dual-formatting strings ending in `.,?!]` or `…`, or longer than 32 characters.
-  Isolate this classification rule in the merger and document it so it can be
-  changed without affecting file processing.
+  records.
+- Dialogue-only mode uses a version-matched classification index derived from
+  structured references in the selected game's resources. It dual-formats only
+  IDs confirmed as in-dialogue scene subtitles. It leaves overhead/oneliner
+  text, item names, HUD/UI text, quest objectives, and other non-dialogue
+  strings in the primary language.
+- If one ID is used in multiple contexts or the classifier cannot determine
+  its context, leave that entry in the primary language. Do not infer context
+  from punctuation, length, or wording.
+- The classifier index is tied to the game version and relevant resource
+  fingerprints. Rebuild or validate it after game updates. If no compatible
+  index can be produced for a build, disable dialogue-only mode for that build
+  and keep full-text generation available.
+- The exact resource parser/index source is a compatibility requirement to
+  validate against the local Remastered 5.00 installation before claiming
+  dialogue-only support.
 - Output files replace only the selected primary language's matching assets;
   all other languages and unrelated game files remain untouched.
 - Validate that the converter accepts the game's source resources before
@@ -136,10 +170,11 @@ never used as scratch space.
 Managed state and exact original backups live outside the game directory under
 the current user's local application-data directory, keyed by a stable hash of
 the normalized game path. A manifest records the supported game identity,
-language pair, mode, game version at generation and install, Steam build ID
-when available, fingerprints of the primary and secondary source resource
-inventories, converter and application versions, each target relative path,
-original backup path and SHA-256, and installed file SHA-256.
+language pair, mode, game version at generation and install, storefront
+identity and build identifier when available, fingerprints of the primary and
+secondary source resource inventories, converter and application versions,
+classifier index version/hash when used, each target relative path, original
+backup path and SHA-256, and installed file SHA-256.
 
 Keep a separate generation record beside staged outputs so their version and
 input fingerprints remain available before installation. When installing,
@@ -147,7 +182,8 @@ copy that generation snapshot into the install manifest and record the version
 detected immediately before files are changed as the install version.
 
 The game version identity includes the executable's reported file/product
-version and the Steam build ID when the app manifest provides one. Resource
+version and the storefront build ID when the local store manifest provides
+one. Resource
 fingerprints include relative paths and SHA-256 hashes for every primary and
 secondary `.w3strings` input used by the generated output, including additions
 or removals from either inventory.
@@ -214,8 +250,12 @@ before installation.
   executable under `bin\x64` or `bin\x64_dx12`. Check the executable's reported
   major/minor version as well as the required `content` and `dlc` structure.
   Explain which check failed and let the user choose another path.
-- If Steam registry or library metadata is malformed, inaccessible, or points
-  to a missing game folder, show the discovery issue and allow manual browsing.
+- If a storefront registry record or install manifest is malformed,
+  inaccessible, or points to a missing game folder, show the discovery issue
+  and allow manual browsing.
+- If the dialogue classifier cannot be built or validated for the selected
+  game version, disable dialogue-only mode with an explanation; keep
+  full-text mode available.
 - If the game version or source fingerprint changes between generation and
   install, stop and request regeneration before touching game files.
 - Reject incomplete language pairs, missing converter, malformed CSV, duplicate
@@ -231,9 +271,9 @@ before installation.
 
 - The app starts as a GUI and can browse to and validate the known F: Remastered
   5.00 installation.
-- Startup discovery reads the Steam client registry path and library metadata,
-  resolves App ID 292030 to the F: installation, and falls back to manual
-  browsing when discovery cannot produce a valid game folder.
+- Startup discovery covers Steam, GOG, and Epic records, resolves this
+  machine's Steam App ID 292030 to the F: installation, and falls back to
+  manual browsing when discovery cannot produce a valid game folder.
 - The app detects game version both on startup and immediately after a folder
   is selected, and displays the result.
 - The language selectors are populated from discovered usable game assets,
@@ -241,11 +281,17 @@ before installation.
 - A chosen primary/secondary pair produces correctly ordered dual text in
   matching entries, retains primary-only entries, and leaves unrelated language
   and game files unchanged.
-- Full-text and dialogue-only modes are selectable and reflected in generated
-  output.
+- Full-text mode combines every matching entry. Dialogue-only mode combines
+  only entries confirmed as in-dialogue scene subtitles by the validated
+  classifier index; it leaves overhead/oneliner text, item names, HUD/UI text,
+  objectives, and ambiguous or unknown entries in the primary language. It
+  uses no punctuation/length heuristic.
+- If no classifier index is available for the selected game build, the UI
+  disables dialogue-only mode and explains why.
 - Install makes a verified backup and a manifest before changing any file.
-- Generation and install metadata include the game version, Steam build ID when
-  available, and fingerprints of the language resources used.
+- Generation and install metadata include the game version, storefront and
+  store build identifier when available, classifier index hash when used, and
+  fingerprints of the language resources used.
 - If a game upgrade changes any source language resource or its inventory, the
   app identifies the generated files as stale and requires regeneration before
   install/modify. If a managed install is active, the app requires uninstall
@@ -269,6 +315,10 @@ with representative converter CSV inputs, exercise the GUI against the known
 game directory, and perform an install/modify/uninstall cycle against an
 isolated copied fixture rather than the live game. Confirm backup and installed
 hashes and inspect the exact target-file inventory before any live install.
+For dialogue-only mode, validate the classifier against known in-dialogue
+subtitles, overhead/oneliner text, item names, objectives, and ambiguous IDs
+from the selected build; if those contexts cannot be established from its
+structured resources, keep dialogue-only mode disabled.
 
 ## Scope and rollout
 
