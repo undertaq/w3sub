@@ -56,6 +56,40 @@ class DialogueIndexTests(unittest.TestCase):
         self.assertEqual(index.context_for("700", "0700"), DialogContext.UNKNOWN)
         self.assertEqual(index.context_for("100", "wrong-key"), DialogContext.UNKNOWN)
 
+    def test_padded_hash_spelling_resolves_same_identity_and_digest(self):
+        padded = self.make_index({("001", "0000000A"): [DialogContext.SCENE_SUBTITLE]})
+        plain = self.make_index({("1", "a"): [DialogContext.SCENE_SUBTITLE]})
+        for spelling in ("a", "A", "0000000a", "000A"):
+            self.assertEqual(padded.context_for("1", spelling), DialogContext.SCENE_SUBTITLE)
+            self.assertEqual(plain.context_for("001", spelling), DialogContext.SCENE_SUBTITLE)
+        self.assertEqual(padded.digest, plain.digest)
+
+    def test_equivalent_hash_spellings_union_conflicting_contexts_for_native_merge(self):
+        from w3sub_app.merge import merge_records
+        from w3sub_app.models import MergeMode
+        from w3sub_app.w3strings_native import StringsFile
+        index = self.make_index({
+            ("1", "a"): [DialogContext.SCENE_SUBTITLE],
+            ("01", "0000000A"): [DialogContext.ITEM],
+        })
+        self.assertTrue(index.validated)
+        for spelling in ("a", "0000000a", "000A"):
+            self.assertEqual(index.context_for("1", spelling), DialogContext.AMBIGUOUS)
+        primary = StringsFile(164, 0, ((1, "primary"),), ((10, 1),))
+        secondary = StringsFile(164, 0, ((1, "secondary"),), ((10, 1),))
+        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game), primary)
+
+    def test_native_merge_accepts_padded_only_confirmed_subtitle(self):
+        from w3sub_app.merge import merge_records
+        from w3sub_app.models import MergeMode
+        from w3sub_app.w3strings_native import StringsFile
+        index = self.make_index({("1", "0000000a"): [DialogContext.SCENE_SUBTITLE]})
+        primary = StringsFile(164, 0, ((1, "primary"),), ((10, 1),))
+        secondary = StringsFile(164, 0, ((1, "secondary"),), ((10, 1),))
+        result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game)
+        self.assertEqual(result.strings, ((1, "primary<br>secondary"),))
+        self.assertEqual(result.keys, primary.keys)
+
     def test_digest_binds_version_fingerprint_schema_and_contexts(self):
         scene = self.make_index({("100", "A001"): [DialogContext.SCENE_SUBTITLE]})
         overhead = self.make_index({("100", "A001"): [DialogContext.OVERHEAD]})

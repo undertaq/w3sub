@@ -53,7 +53,9 @@ def _normalize_identity(string_id: str, key: str) -> Identity | None:
         return None
     if not isinstance(key, str) or not re.fullmatch(r"[0-9a-fA-F]+", key.strip()):
         return None
-    return str(int(string_id.strip())), key.strip().lower()
+    # Hash padding/case are spelling differences, not different game keys.
+    # Ingestion and lookup share this function so aliases union their contexts.
+    return str(int(string_id.strip())), format(int(key.strip(), 16), "x")
 
 
 def _version_payload(version: GameVersion) -> dict[str, str | None]:
