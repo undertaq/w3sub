@@ -79,3 +79,54 @@ class GenerationRecord:
     app_version: str
     output_files: dict[str, str]
     output_hashes: dict[str, str]
+
+
+@dataclass(frozen=True)
+class InstallTarget:
+    relative_path: str
+    backup_path: Path
+    original_sha256: str
+    installed_sha256: str
+
+
+@dataclass(frozen=True)
+class InstallManifest:
+    schema_version: int
+    install_id: str
+    game_root: Path
+    state_directory: Path
+    backup_directory: Path
+    storefront: Storefront
+    store_build_id: str | None
+    generation_id: str
+    generation_version: GameVersion
+    install_version: GameVersion
+    source_fingerprint: ResourceFingerprint
+    primary_language: str
+    secondary_language: str
+    mode: MergeMode
+    classifier_digest: str | None
+    target_files: dict[str, InstallTarget]
+    active: bool
+    conflicted: bool = False
+    conflict_paths: tuple[str, ...] = ()
+    prepared: bool = False
+
+
+@dataclass(frozen=True)
+class InstallComparison:
+    freshness: Freshness
+    conflict_paths: tuple[str, ...] = ()
+
+    @property
+    def uninstall_safe(self) -> bool:
+        return not self.conflict_paths
+
+
+@dataclass(frozen=True)
+class UninstallResult:
+    restored_paths: tuple[str, ...]
+    backup_directory: Path
+    conflicts: tuple[str, ...] = ()
+    rollback_errors: tuple[str, ...] = ()
+    error: str | None = None
