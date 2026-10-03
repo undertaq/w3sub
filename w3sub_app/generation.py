@@ -7,7 +7,7 @@ import tempfile
 import uuid
 import shutil
 
-from .dialogue_index import load_dialogue_index
+from .dialogue_index import INDEX_SCHEMA_VERSION, load_dialogue_index
 from .merge import MergeError, merge_csv, merge_records
 from .converter import check_compatibility
 from .w3strings_native import NativeW3StringsCodec
@@ -213,6 +213,7 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "mode": record.mode.value,
         "source_fingerprint": _fingerprint_payload(record.source_fingerprint),
         "classifier_digest": record.classifier_digest,
+        "classifier_schema_version": record.classifier_schema_version,
         "converter_path": record.converter_path,
         "converter_sha256": record.converter_sha256,
         "converter_version": record.converter_version,
@@ -349,6 +350,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
             output_files=output_files,
             output_hashes=output_hashes,
             codec_kind="native" if native else "external",
+            classifier_schema_version=(getattr(dialogue_index, "schema_version", INDEX_SCHEMA_VERSION)
+                                       if dialogue_index is not None else None),
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -368,6 +371,9 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         raise ValueError("unsupported generation record schema")
     if payload.get("codec_kind", "external") not in ("native", "external"):
         raise ValueError("unsupported generation codec kind")
+    classifier_schema = payload.get("classifier_schema_version")
+    if classifier_schema is not None and (type(classifier_schema) is not int or classifier_schema < 1):
+        raise ValueError("invalid classifier schema version")
     version = payload.get("game_version")
     fingerprint = payload.get("source_fingerprint")
     if not isinstance(version, dict) or not isinstance(fingerprint, dict):
@@ -429,6 +435,7 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         output_files=dict(output_files),
         output_hashes=dict(output_hashes),
         codec_kind=payload.get("codec_kind", "external"),
+        classifier_schema_version=classifier_schema,
     )
     return record
 

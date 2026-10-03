@@ -13,6 +13,16 @@ from typing import Mapping, Protocol
 from .models import GameCandidate, Storefront
 
 
+def refresh_candidate(candidate: GameCandidate) -> GameCandidate:
+    """Read current storefront records for this canonical root, never cached build IDs."""
+    identity = os.path.normcase(str(candidate.root.expanduser().resolve()))
+    for current in discover_candidates():
+        if os.path.normcase(str(current.root.expanduser().resolve())) == identity:
+            return current
+    # A disappeared/unavailable store record cannot confirm the previous build.
+    return replace(candidate, root=candidate.root.expanduser().resolve(), store_build_id=None)
+
+
 class RegistryReader(Protocol):
     def values(self, hive: str, view: int, key: str) -> Mapping[str, object]: ...
     def subkeys(self, hive: str, view: int, key: str) -> list[str]: ...

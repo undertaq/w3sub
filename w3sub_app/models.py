@@ -86,6 +86,17 @@ class GenerationRecord:
     output_files: dict[str, str]
     output_hashes: dict[str, str]
     codec_kind: str = "external"
+    classifier_schema_version: int | None = None
+
+
+@dataclass(frozen=True)
+class GenerationProvenance:
+    codec_kind: str
+    converter_path: str
+    converter_sha256: str
+    converter_version: str | None
+    app_version: str
+    classifier_schema_version: int | None
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,7 @@ class InstallManifest:
     conflicted: bool = False
     conflict_paths: tuple[str, ...] = ()
     prepared: bool = False
+    generation_provenance: GenerationProvenance | None = None
 
 
 @dataclass(frozen=True)

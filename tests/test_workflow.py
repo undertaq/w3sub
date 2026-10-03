@@ -79,6 +79,10 @@ class WorkflowTests(unittest.TestCase):
         self.converter_path.write_bytes(b"deterministic converter fixture")
         self.converter = FixtureConverter(self.converter_path)
         self.executable_version = "5.0.0.1044392 (Build Machine)"
+        rescan = patch.object(install, "_rescan_game", side_effect=lambda game:
+            scan_game(game.root, game.storefront, game.version.store_build_id, version_reader=self._read_version), create=True)
+        rescan.start()
+        self.addCleanup(rescan.stop)
         self._make_template_game()
         # Lifecycle operations always target this copied tree inside TemporaryDirectory.
         shutil.copytree(self.template_root, self.game_root)

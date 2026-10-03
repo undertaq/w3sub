@@ -276,6 +276,7 @@ def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
         manifest.secondary_language,
         manifest.mode,
         manifest.source_fingerprint.digest,
+        manifest.generation_provenance,
         targets,
         manifest.active,
         manifest.conflicted,
@@ -660,8 +661,9 @@ class W3DualSubtitleApp:
 
     def _rescan_to_candidate(self, selected: ScannedGame):
         def operation():
-            game = scan_selected_folder(selected.candidate.root, candidate=selected.candidate)
-            refreshed = ScannedGame(selected.candidate, game)
+            candidate = storefronts.refresh_candidate(selected.candidate)
+            game = scan_selected_folder(candidate.root, candidate=candidate)
+            refreshed = ScannedGame(candidate, game)
             return refreshed, self._load_game_snapshot(refreshed)
 
         self._submit("rescan selected folder", operation, self._selection_loaded)
@@ -814,8 +816,8 @@ class W3DualSubtitleApp:
         if not self.snapshot:
             raise RuntimeError("Select a game folder first")
         selected = self.snapshot.selected
-        game = scan_game(selected.game.root, selected.candidate.storefront,
-                         selected.candidate.store_build_id)
+        candidate = storefronts.refresh_candidate(selected.candidate)
+        game = scan_game(candidate.root, candidate.storefront, candidate.store_build_id)
         state = config.state_root_for(game.root)
         manifest = install.load_install_manifest(state, game.root)
         if reviewed_manifest_signature is not None:

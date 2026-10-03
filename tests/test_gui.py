@@ -100,6 +100,51 @@ class GuiHelperTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="w3sub gui ")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        rescan = patch("w3sub_app.install._rescan_game", side_effect=lambda game: game, create=True)
+        rescan.start()
+        self.addCleanup(rescan.stop)
+
+    def test_rescan_refreshes_storefront_build_for_canonical_root(self):
+        from w3sub_app import gui as gui_module
+        game = self.make_game("rescan metadata")
+        candidate = GameCandidate(game.root, game.storefront, "cached", game.version.store_build_id)
+        fresh_candidate = replace(candidate, root=game.root / ".", store_build_id="build-new")
+        selected = gui_module.ScannedGame(candidate, game)
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        captured = []
+        app._submit = lambda label, operation, callback: captured.append(operation())
+        app._load_game_snapshot = lambda scanned: scanned.game
+        app._selection_loaded = lambda result: None
+        def scanner(root, storefront, build):
+            return replace(game, version=replace(game.version, store_build_id=build))
+        with patch("w3sub_app.gui.storefronts.discover_candidates", return_value=[fresh_candidate]), \
+             patch("w3sub_app.gui.scan_game", side_effect=scanner):
+            app._rescan_to_candidate(selected)
+        self.assertEqual(captured[0][0].game.version.store_build_id, "build-new")
+        self.assertEqual(captured[0][0].candidate.store_build_id, "build-new")
+
+    def test_lifecycle_preflight_refreshes_storefront_build_metadata(self):
+        from w3sub_app import gui as gui_module
+        game = self.make_game("lifecycle metadata")
+        candidate = GameCandidate(game.root, game.storefront, "cached", game.version.store_build_id)
+        fresh_candidate = replace(candidate, store_build_id="build-new")
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        app.snapshot = gui_module.GameSnapshot(gui_module.ScannedGame(candidate, game), None, None, None, None, False)
+        def scanner(root, storefront, build):
+            return replace(game, version=replace(game.version, store_build_id=build))
+        with patch("w3sub_app.gui.storefronts.discover_candidates", return_value=[fresh_candidate]), \
+             patch("w3sub_app.gui.scan_game", side_effect=scanner), \
+             patch("w3sub_app.gui.install.load_install_manifest", return_value=None):
+            refreshed, _, _, _ = app._fresh_game_and_manifest()
+        self.assertEqual(refreshed.version.store_build_id, "build-new")
+
+    def test_missing_storefront_record_does_not_reuse_cached_build(self):
+        from w3sub_app import storefronts
+        game = self.make_game("missing metadata")
+        candidate = GameCandidate(game.root, game.storefront, "cached", "old-build")
+        with patch.object(storefronts, "discover_candidates", return_value=[]):
+            self.assertIsNone(storefronts.refresh_candidate(candidate).store_build_id)
+
 
     def make_game(self, name, languages=("en", "zh")):
         root = self.base / name

@@ -1,6 +1,6 @@
 """Transactional install lifecycle for generated Witcher 3 string resources."""
 import csv
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
@@ -10,12 +10,15 @@ import shutil
 import stat
 import uuid
 
-from . import generation
+from . import generation, storefronts
+from .game import scan_game
 from .models import (
     Freshness,
     GameInstallation,
+    GameCandidate,
     GameVersion,
     GenerationRecord,
+    GenerationProvenance,
     InstallComparison,
     InstallManifest,
     InstallTarget,
@@ -200,6 +203,8 @@ def _manifest_payload(manifest: InstallManifest) -> dict[str, object]:
         "secondary_language": manifest.secondary_language,
         "mode": manifest.mode.value,
         "classifier_digest": manifest.classifier_digest,
+        "generation_provenance": (asdict(manifest.generation_provenance)
+                                  if manifest.generation_provenance is not None else None),
         "target_files": {
             relative: {
                 "relative_path": target.relative_path,
@@ -241,6 +246,10 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
     if not isinstance(raw_fingerprint, dict) or not isinstance(raw_fingerprint.get("entries"), dict):
         raise ValueError("source_fingerprint must contain an entries object")
     fingerprint = ResourceFingerprint(dict(raw_fingerprint["entries"]), raw_fingerprint["digest"])
+    raw_provenance = payload.get("generation_provenance")
+    if raw_provenance is not None and not isinstance(raw_provenance, dict):
+        raise ValueError("generation_provenance must be an object or null")
+    provenance = GenerationProvenance(**raw_provenance) if raw_provenance is not None else None
     targets = {}
     for relative, entry in payload["target_files"].items():
         if entry["relative_path"] != relative:
@@ -272,6 +281,7 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
         conflicted=bool(payload.get("conflicted", False)),
         conflict_paths=tuple(payload.get("conflict_paths", ())),
         prepared=bool(payload.get("prepared", False)),
+        generation_provenance=provenance,
     )
 
 
@@ -300,6 +310,7 @@ def _atomic_write_manifest(manifest: InstallManifest) -> None:
 def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
     if not isinstance(manifest, InstallManifest):
         raise InstallError("Install manifest has an unsupported type")
+    _validate_provenance(manifest.generation_provenance)
     root = _normalized_path(game_root)
     if _path_identity(manifest.game_root) != _path_identity(root):
         raise InstallError("Install manifest belongs to a different game folder")
@@ -333,6 +344,22 @@ def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
 def _is_digest(value: object) -> bool:
     return (isinstance(value, str) and len(value) == 64
             and all(character in "0123456789abcdef" for character in value.lower()))
+
+
+def _validate_provenance(provenance: GenerationProvenance | None) -> None:
+    if provenance is None:  # Older manifests did not carry this snapshot.
+        return
+    if (not isinstance(provenance, GenerationProvenance)
+            or provenance.codec_kind not in ("native", "external")
+            or not isinstance(provenance.converter_path, str)
+            or not Path(provenance.converter_path).is_absolute()
+            or not _is_digest(provenance.converter_sha256)
+            or not isinstance(provenance.converter_version, (str, type(None)))
+            or not isinstance(provenance.app_version, str) or not provenance.app_version
+            or (provenance.classifier_schema_version is not None and
+                (type(provenance.classifier_schema_version) is not int or
+                 provenance.classifier_schema_version < 1))):
+        raise InstallError("Install generation provenance is malformed")
 
 
 def _load_manifest_file(path: Path, game_root: Path | None = None) -> InstallManifest:
@@ -544,6 +571,37 @@ def _generation_freshness(record: GenerationRecord, game: GameInstallation,
     return generation.compare_generation(record, game, overrides)
 
 
+def _rescan_game(game: GameInstallation) -> GameInstallation:
+    candidate = storefronts.refresh_candidate(GameCandidate(
+        game.root, game.storefront, "install operation", game.version.store_build_id))
+    return scan_game(candidate.root, candidate.storefront, candidate.store_build_id)
+
+
+def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation,
+                                overrides: dict[str, Path] | None = None) -> None:
+    """Called under the operation lock after staging, before any game replacement."""
+    _ensure_game_closed()
+    try:
+        current = _rescan_game(game)
+        if current.version != game.version or current.storefront is not game.storefront:
+            raise InstallError("Game version/storefront changed during operation; rescan and retry")
+        freshness = _generation_freshness(record, current, overrides)
+        if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
+            raise InstallError(f"Generation became {freshness.value} before mutation; regenerate")
+    except InstallError:
+        raise
+    except Exception as error:
+        raise InstallError(f"Cannot revalidate game immediately before mutation: {error}") from error
+
+
+def _require_generation_baselines(targets: dict[str, InstallTarget], record: GenerationRecord,
+                                  backup_directory: Path) -> None:
+    for relative, target in targets.items():
+        if target.original_sha256 != record.source_fingerprint.entries.get(relative):
+            raise InstallError(f"Original backup differs from generation baseline: {relative}",
+                               target_paths=(relative,), backup_directory=backup_directory)
+
+
 def _verified_outputs(record: GenerationRecord, game: GameInstallation) -> dict[str, Path]:
     if not generation._verify_outputs(record, game.root):
         raise InstallError("Generation output inventory or hash is invalid")
@@ -566,6 +624,10 @@ def _make_manifest(game: GameInstallation, record: GenerationRecord,
                    active: bool, conflicted: bool = False,
                    conflict_paths: tuple[str, ...] = (),
                    prepared: bool = False) -> InstallManifest:
+    provenance = GenerationProvenance(record.codec_kind, record.converter_path,
+                    record.converter_sha256, record.converter_version, record.app_version,
+                    record.classifier_schema_version)
+    _validate_provenance(provenance)
     return InstallManifest(
         schema_version=INSTALL_MANIFEST_SCHEMA,
         install_id=install_id,
@@ -587,6 +649,7 @@ def _make_manifest(game: GameInstallation, record: GenerationRecord,
         conflicted=conflicted,
         conflict_paths=tuple(conflict_paths),
         prepared=prepared,
+        generation_provenance=provenance,
     )
 
 
@@ -613,7 +676,8 @@ def _apply_transaction(game: GameInstallation,
                        desired_sources: dict[str, Path],
                        desired_hashes: dict[str, str],
                        expected_current: dict[str, str],
-                       *, remove_manifest_on_rollback: bool = False) -> None:
+                       *, remove_manifest_on_rollback: bool = False,
+                       pre_mutation_check=None) -> None:
     root = _normalized_path(game.root)
     if set(desired_sources) != set(desired_hashes) or set(desired_sources) != set(expected_current):
         raise InstallError("Transaction path inventory is inconsistent")
@@ -630,6 +694,7 @@ def _apply_transaction(game: GameInstallation,
     snapshots: dict[str, Path] = {}
     stages: dict[str, Path] = {}
     attempted: list[str] = []
+    restore_stages: list[Path] = []
     try:
         transaction_directory.mkdir(parents=True, exist_ok=False)
         for relative, target in targets.items():
@@ -646,6 +711,9 @@ def _apply_transaction(game: GameInstallation,
             if _hash_file(stages[relative]) != desired_hashes[relative]:
                 raise InstallError(f"Staged replacement hash mismatch: {relative}",
                                    target_paths=(relative,), backup_directory=backup_directory)
+
+        if pre_mutation_check is not None:
+            pre_mutation_check()
 
         for relative, target in targets.items():
             if _hash_file(target) != expected_current[relative]:
@@ -672,9 +740,15 @@ def _apply_transaction(game: GameInstallation,
         for relative in reversed(attempted):
             target = targets[relative]
             try:
-                if _hash_file(target) == expected_current[relative]:
+                current_hash = _hash_file(target)
+                if current_hash == expected_current[relative]:
                     continue
+                if current_hash != desired_hashes[relative]:
+                    raise OSError("unexpected third-party bytes preserved; rollback requires recovery")
                 restore_stage = _sibling_stage(target, snapshots[relative], "w3sub-rollback")
+                restore_stages.append(restore_stage)
+                if _hash_file(target) != desired_hashes[relative]:
+                    raise OSError("target changed while preparing rollback; unexpected bytes preserved")
                 os.replace(restore_stage, target)
                 if _hash_file(target) != expected_current[relative]:
                     raise OSError("restored hash does not match the transaction snapshot")
@@ -707,7 +781,7 @@ def _apply_transaction(game: GameInstallation,
                            rollback_errors=rollback_errors,
                            backup_directory=backup_directory) from operation_error
     finally:
-        for stage in stages.values():
+        for stage in (*stages.values(), *restore_stages):
             try:
                 stage.unlink(missing_ok=True)
             except OSError:
@@ -749,6 +823,7 @@ def install_generation(game: GameInstallation, generation_record: GenerationReco
             relative: replace(target, installed_sha256=generation_record.output_hashes[relative])
             for relative, target in targets.items()
         }
+        _require_generation_baselines(targets, generation_record, backup_directory)
         final = _make_manifest(game, generation_record, state, backup_directory,
                                install_id, targets, active=True)
         prepared = replace(final, prepared=True)
@@ -756,7 +831,8 @@ def install_generation(game: GameInstallation, generation_record: GenerationReco
         expected = {relative: targets[relative].original_sha256 for relative in outputs}
         _apply_transaction(game, state, backup_directory, prepared, final,
                            None, outputs, desired_hashes, expected,
-                           remove_manifest_on_rollback=True)
+                           remove_manifest_on_rollback=True,
+                           pre_mutation_check=lambda: _revalidate_before_mutation(generation_record, game))
         return final
 
 
@@ -915,6 +991,8 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         old_paths = set(manifest.target_files)
         union = output_paths | old_paths
         all_targets = _copy_new_backups(manifest, game, output_paths)
+        _require_generation_baselines({relative: all_targets[relative] for relative in output_paths},
+                                      generation_record, manifest.backup_directory)
         final_targets = {
             relative: replace(all_targets[relative],
                               installed_sha256=generation_record.output_hashes[relative])
@@ -943,7 +1021,8 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
                 desired_hashes[relative] = previous.original_sha256
         _apply_transaction(game, state, manifest.backup_directory,
                            prepared, final, manifest,
-                           desired_sources, desired_hashes, expected)
+                           desired_sources, desired_hashes, expected,
+                           pre_mutation_check=lambda: _revalidate_before_mutation(generation_record, game, overrides))
         return final
 
 

@@ -1,4 +1,6 @@
 import os
+import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -47,6 +49,187 @@ class InstallTests(unittest.TestCase):
         self.converter_path.write_bytes(b"fixture converter")
         self.converter = FixtureConverter(self.converter_path)
         self.game = self.make_game()
+        rescan = patch.object(install, "_rescan_game", side_effect=lambda game: game, create=True)
+        rescan.start()
+        self.addCleanup(rescan.stop)
+
+    def use_native_fixture(self):
+        from w3sub_app.w3strings_native import StringsFile, encode
+        for language, paths in self.game.language_files.items():
+            for path in paths:
+                path.write_bytes(encode(StringsFile(164, 0, ((1, language),), ((7, 1),))))
+        self.converter = None
+
+    def test_install_rejects_source_changed_after_freshness_before_backup(self):
+        self.use_native_fixture()
+        record = self.generate_record()
+        target = self.game.language_files["en"][0]
+        verified = install._verified_outputs
+        def changed(record, game):
+            outputs = verified(record, game)
+            target.write_bytes(b"updated original after freshness")
+            return outputs
+        with patch.object(install, "_verified_outputs", side_effect=changed):
+            with self.assertRaises(install.InstallError):
+                install.install_generation(self.game, record, self.state_root)
+        self.assertEqual(target.read_bytes(), b"updated original after freshness")
+        self.assertIsNone(install.load_install_manifest(self.state_root))
+
+    def test_modify_rejects_new_target_changed_after_freshness_before_backup(self):
+        self.use_native_fixture()
+        first = self.generate_record()
+        manifest = install.install_generation(self.game, first, self.state_root)
+        overrides = {relative: target.backup_path for relative, target in manifest.target_files.items()}
+        record = self.generate_record("zh", "en", overrides)
+        new_target = self.game.language_files["zh"][0]
+        old_targets = self.installed_targets(manifest)
+        verified = install._verified_outputs
+        def changed(record, game):
+            outputs = verified(record, game)
+            new_target.write_bytes(b"updated newly targeted original")
+            return outputs
+        with patch.object(install, "_verified_outputs", side_effect=changed):
+            with self.assertRaises(install.InstallError):
+                install.modify_install(self.game, record, manifest)
+        self.assertEqual(new_target.read_bytes(), b"updated newly targeted original")
+        self.assertEqual(self.installed_targets(manifest), old_targets)
+        self.assertEqual(install.load_install_manifest(self.state_root), manifest)
+
+    def test_install_rechecks_secondary_sources_immediately_before_mutation(self):
+        record = self.generate_record()
+        stage = install._sibling_stage
+        secondary = self.game.language_files["zh"][0]
+        def changed(target, source, prefix):
+            result = stage(target, source, prefix)
+            if prefix == "w3sub-stage":
+                secondary.write_bytes(b"secondary changed during staging")
+            return result
+        originals = self.originals()
+        with patch.object(install, "_sibling_stage", side_effect=changed):
+            with self.assertRaises(install.InstallError):
+                install.install_generation(self.game, record, self.state_root)
+        self.assertEqual(self.game.language_files["en"][0].read_bytes(), originals["content/content0/en.w3strings"])
+        self.assertEqual(secondary.read_bytes(), b"secondary changed during staging")
+
+    def test_install_rechecks_version_under_lock_before_mutation(self):
+        record = self.generate_record()
+        updated = replace(self.game, version=replace(self.game.version, store_build_id="updated-build"))
+        def rescan(game):
+            self.assertTrue((Path(record.generation_dir).parents[1] / "operation.lock").is_file())
+            return updated
+        with patch.object(install, "_rescan_game", side_effect=rescan):
+            with self.assertRaises(install.InstallError):
+                install.install_generation(self.game, record, self.state_root)
+
+    def test_install_rechecks_complete_resource_inventory_before_mutation(self):
+        record = self.generate_record()
+        new_en = self.game_root / "content/new/en.w3strings"
+        new_zh = self.game_root / "content/new/zh.w3strings"
+        new_en.parent.mkdir()
+        new_en.write_bytes(b"new en")
+        new_zh.write_bytes(b"new zh")
+        updated = replace(self.game, language_files={"en": (*self.game.language_files["en"], new_en),
+                                                   "zh": (*self.game.language_files["zh"], new_zh)})
+        with patch.object(install, "_rescan_game", return_value=updated):
+            with self.assertRaises(install.InstallError):
+                install.install_generation(self.game, record, self.state_root)
+
+    def test_modify_rechecks_effective_secondary_source_before_mutation(self):
+        first = self.generate_record()
+        manifest = install.install_generation(self.game, first, self.state_root)
+        overrides = {relative: target.backup_path for relative, target in manifest.target_files.items()}
+        record = self.generate_record(overrides=overrides)
+        before = self.installed_targets(manifest)
+        stage = install._sibling_stage
+        def changed(target, source, prefix):
+            staged = stage(target, source, prefix)
+            if prefix == "w3sub-stage":
+                self.game.language_files["zh"][0].write_bytes(b"secondary update during Modify")
+            return staged
+        with patch.object(install, "_sibling_stage", side_effect=changed):
+            with self.assertRaises(install.InstallError):
+                install.modify_install(self.game, record, manifest)
+        self.assertEqual(self.installed_targets(manifest), before)
+        self.assertEqual(install.load_install_manifest(self.state_root), manifest)
+        self.assertEqual(self.game.language_files["zh"][0].read_bytes(), b"secondary update during Modify")
+
+    def test_rollback_preserves_third_party_bytes_and_recovery_state(self):
+        record = self.generate_record()
+        first = self.game_root / "content/content0/en.w3strings"
+        second = self.game_root / "content/dlc0/en.w3strings"
+        original = first.read_bytes()
+        real_replace = os.replace
+        def interfere(source, destination):
+            destination = Path(destination)
+            if destination == second and "w3sub-stage" in Path(source).name:
+                raise PermissionError("second replacement failed")
+            result = real_replace(source, destination)
+            if destination == first and "w3sub-stage" in Path(source).name:
+                first.write_bytes(b"third-party bytes after replacement")
+            return result
+        with patch.object(install.os, "replace", side_effect=interfere):
+            with self.assertRaises(install.InstallError) as caught:
+                install.install_generation(self.game, record, self.state_root)
+        self.assertEqual(first.read_bytes(), b"third-party bytes after replacement")
+        self.assertIn("content/content0/en.w3strings", " ".join(caught.exception.rollback_errors))
+        manifest = install.load_install_manifest(self.state_root)
+        self.assertTrue(manifest.prepared and manifest.conflicted)
+        self.assertEqual(manifest.conflict_paths, ("content/content0/en.w3strings",))
+        self.assertEqual(manifest.target_files["content/content0/en.w3strings"].backup_path.read_bytes(), original)
+        snapshots = list(manifest.state_directory.glob("transactions/*/content/content0/en.w3strings"))
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].read_bytes(), original)
+
+    def assert_provenance_persisted(self, record):
+        manifest = install.install_generation(self.game, record, self.state_root)
+        payload = json.loads((manifest.state_directory / "install.json").read_text(encoding="utf-8"))
+        self.assertIn("generation_provenance", payload)
+        expected = {"codec_kind": record.codec_kind, "converter_path": record.converter_path,
+                    "converter_sha256": record.converter_sha256, "converter_version": record.converter_version,
+                    "app_version": record.app_version, "classifier_schema_version": record.classifier_schema_version}
+        self.assertEqual(payload["generation_provenance"], expected)
+        for path in Path(record.generation_dir).rglob("*"):
+            if path.is_file():
+                path.unlink()
+        loaded = install.load_install_manifest(self.state_root)
+        self.assertEqual(loaded, manifest)
+        payload.pop("generation_provenance")
+        (manifest.state_directory / "install.json").write_text(json.dumps(payload), encoding="utf-8")
+        legacy = install.load_install_manifest(self.state_root)
+        self.assertIsNone(legacy.generation_provenance)
+        self.assertTrue(legacy.active)
+
+    def test_native_manifest_retains_generation_provenance_without_staged_generation(self):
+        self.use_native_fixture()
+        self.assert_provenance_persisted(self.generate_record())
+
+    def test_external_manifest_retains_generation_provenance_without_staged_generation(self):
+        self.assert_provenance_persisted(self.generate_record())
+
+    def test_generation_and_manifest_capture_classifier_schema_version(self):
+        from w3sub_app.dialogue_index import DialogueIndex, DialogContext
+        source = self.game_root / "content/refs/schema.json"
+        source.parent.mkdir()
+        source.write_text("{}", encoding="utf-8")
+        index = DialogueIndex.from_validated_references(self.game, [source],
+                    {("1", "1"): [DialogContext.SCENE_SUBTITLE]},
+                    source_roots=[source.parent], source_patterns=["*.json"])
+        with patch("w3sub_app.generation.load_dialogue_index", return_value=index):
+            record = generate(GenerationRequest(self.game, "en", "zh", MergeMode.DIALOGUE_ONLY), self.state_root, self.converter)
+            self.assertEqual(getattr(record, "classifier_schema_version", None), index.schema_version)
+            self.assert_provenance_persisted(record)
+
+    def test_malformed_generation_provenance_cannot_load_as_valid_install(self):
+        manifest = install.install_generation(self.game, self.generate_record(), self.state_root)
+        path = manifest.state_directory / "install.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        for field, value in (("codec_kind", "unknown"), ("converter_sha256", "not a hash"),
+                             ("classifier_schema_version", True), ("converter_path", "relative.exe")):
+            payload = json.loads(json.dumps(original))
+            payload["generation_provenance"][field] = value
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(install.InstallError):
+                install.load_install_manifest(self.state_root)
 
     def make_game(self):
         languages = {"en": [], "zh": []}
