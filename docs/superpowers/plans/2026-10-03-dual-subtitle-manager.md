@@ -181,7 +181,7 @@ class GenerationRecord:
 
 **Interfaces:**
 - Produces `W3StringsConverter(executable: Path)`, `decode(source: Path, work_dir: Path) -> Path`, `encode(csv_path: Path, work_dir: Path) -> Path`, and `merge_csv(primary: Path, secondary: Path, mode: MergeMode, dialogue_index: DialogueIndex | None) -> Path`.
-- `DialogueIndex` is defined in Task 4; Task 3 must accept `None` and raise `MergeError` for dialogue-only mode if no validated index is supplied.
+- `DialogueIndex` is defined in Task 4; Task 3 accepts `None`, and Task 4 changes missing/stale/unclassifiable dialogue context to preserve the primary row. The GUI disables dialogue-only mode when no validated index is available.
 
 - [ ] **Step 1: Add tests** for converter exit errors, argument-safe paths containing spaces, CSV metadata comments, text with `|` and `<br>`, record matching by `(id, key)`, primary-only retention, secondary-only omission, and primary-first `<br>` output in full-text mode.
 - [ ] **Step 2: Run focused tests and confirm they fail.**
