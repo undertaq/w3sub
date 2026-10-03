@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import struct
 
-CODEC_VERSION = "native-w3strings-1"
+CODEC_VERSION = "native-w3strings-2"
 LANGUAGE_MAGICS = {
     0: 0, 0x24987354: 0x21793217, 0x75886138: 0x42791159,
     0x43975139: 0x79321793, 0x18796651: 0x42387566,
@@ -156,7 +156,10 @@ def encode(record: StringsFile) -> bytes:
         magic = LANGUAGE_MAGICS[record.language_key]
         entries = bytearray()
         buffer = bytearray()
-        for string_id, text in sorted(record.strings):
+        # The game searches the on-disk string index by its obfuscated ID.
+        # Official v164 resources order this block by (ID ^ language magic).
+        ordered_strings = sorted(record.strings, key=lambda item: item[0] ^ magic)
+        for string_id, text in ordered_strings:
             raw = text.encode("utf-8" if unit == 1 else "utf-16-le", "strict")
             entries += struct.pack("<III", string_id ^ magic, len(buffer) // unit, len(raw) // unit)
             buffer += _crypt(raw, magic, unit) + bytes(unit)

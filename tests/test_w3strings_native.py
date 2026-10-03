@@ -63,6 +63,18 @@ class NativeCodecTests(unittest.TestCase):
         self.assertEqual(native.decode(raw).strings, ((1, "A"),))
         self.assertEqual(native.encode(native.decode(raw)), raw)
 
+    def test_obfuscated_string_index_is_sorted_for_game_lookup(self):
+        record = native.StringsFile(164, 0x18632176,
+                                    ((1, "one"), (2, "two"), (3, "three"), (4, "four")), ())
+        raw = native.encode(record)
+        reader = native._Reader(raw)
+        reader.take(10)
+        count = reader.count()
+        stored_ids = [struct.unpack("<I", reader.take(12)[:4])[0]
+                      for _ in range(count)]
+
+        self.assertEqual(stored_ids, sorted(stored_ids))
+
     def test_rejects_duplicate_exact_association(self):
         with self.assertRaises(native.NativeCodecError):
             native.decode(fixture(keys=((7, 1), (7, 1))))

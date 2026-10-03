@@ -583,6 +583,15 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
         return Freshness.STALE
     if not _verify_outputs(record, game.root):
         return Freshness.STALE
+    if record.codec_kind == "native":
+        if record.converter_version != NativeW3StringsCodec.version:
+            return Freshness.STALE
+        try:
+            _, current_codec_digest = _hash_executable(NativeW3StringsCodec())
+        except GenerationError:
+            return Freshness.UNREADABLE
+        if record.converter_sha256 != current_codec_digest:
+            return Freshness.STALE
     if game.storefront is not record.storefront:
         return Freshness.STALE
 

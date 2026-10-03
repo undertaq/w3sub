@@ -85,6 +85,16 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(generation.load_latest_generation_record(self.state_root, self.game.root), record)
         self.assertTrue(all(Path(p).read_bytes() == data for p, data in before.items()))
 
+    def test_native_generation_is_stale_when_codec_identity_changes(self):
+        from w3sub_app.w3strings_native import StringsFile, encode
+        for language in ("en", "zh"):
+            for path in self.game.language_files[language]:
+                Path(path).write_bytes(encode(StringsFile(164, 0, ((1, language),), ((7, 1),))))
+        record = generate(self.request(), self.state_root)
+        previous_codec = replace(record, converter_sha256="0" * 64)
+
+        self.assertEqual(compare_generation(previous_codec, self.game), Freshness.STALE)
+
     def test_default_native_generation_rejects_corrupt_resource(self):
         request = GenerationRequest(self.game, "en", "zh", MergeMode.FULL_TEXT)
         with self.assertRaisesRegex(GenerationError, "compatibility"):
