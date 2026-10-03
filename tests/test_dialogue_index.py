@@ -33,7 +33,8 @@ class DialogueIndexTests(unittest.TestCase):
 
     def make_index(self, references):
         return DialogueIndex.from_validated_references(
-            self.game, [self.source], references
+            self.game, [self.source], references,
+            source_roots=[self.source.parent], source_patterns=["*.json"],
         )
 
     def test_classifies_only_confirmed_reference_contexts(self):
@@ -61,6 +62,7 @@ class DialogueIndexTests(unittest.TestCase):
         other_version = DialogueIndex.from_validated_references(
             self.make_game("5.0.0.1044393"), [self.source],
             {("100", "A001"): [DialogContext.SCENE_SUBTITLE]},
+            source_roots=[self.source.parent], source_patterns=["*.json"],
         )
 
         self.assertTrue(scene.validated)
@@ -83,6 +85,32 @@ class DialogueIndexTests(unittest.TestCase):
         self.source.unlink()
 
         self.assertFalse(index.is_current(self.game))
+
+    def test_added_matching_source_invalidates_index_but_unmatched_file_does_not(self):
+        index = self.make_index({("100", "A001"): [DialogContext.SCENE_SUBTITLE]})
+        unrelated = self.source.parent / "readme.txt"
+        unrelated.write_text("not a structured source", encoding="utf-8")
+        self.assertTrue(index.is_current(self.game))
+
+        added = self.source.parent / "new-reference.json"
+        added.write_text('{"use": "same id in another context"}\n', encoding="utf-8")
+
+        self.assertFalse(index.is_current(self.game))
+
+    def test_declared_source_files_must_match_scoped_inventory(self):
+        additional = self.source.parent / "unreported-reference.json"
+        additional.write_text("{}\n", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            self.make_index({("100", "A001"): [DialogContext.SCENE_SUBTITLE]})
+
+    def test_inventory_scope_rejects_game_wide_unfiltered_scan(self):
+        with self.assertRaises(ValueError):
+            DialogueIndex.from_validated_references(
+                self.game, [self.source],
+                {("100", "A001"): [DialogContext.SCENE_SUBTITLE]},
+                source_roots=[self.root], source_patterns=["*"],
+            )
 
     def test_no_supported_live_source_means_no_index(self):
         self.assertIsNone(load_dialogue_index(self.game))

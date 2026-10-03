@@ -18,8 +18,10 @@ dialogue-only support.
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -67,6 +69,7 @@ class DialogueIndex:
 
     game_version: GameVersion
     source_fingerprint: ResourceFingerprint
+    source_scope: tuple[tuple[str, str], ...]
     schema_version: int
     digest: str
     _contexts: Mapping[Identity, frozenset[DialogContext]]
@@ -74,11 +77,21 @@ class DialogueIndex:
     def __init__(self, game_version: GameVersion,
                  source_fingerprint: ResourceFingerprint,
                  references: Mapping[tuple[str, str], Iterable[DialogContext]],
+                 source_scope: Sequence[tuple[str, str]],
                  schema_version: int = INDEX_SCHEMA_VERSION):
         if schema_version != INDEX_SCHEMA_VERSION:
             raise ValueError(f"Unsupported dialogue index schema: {schema_version}")
         if not source_fingerprint.entries:
             raise ValueError("A dialogue index requires at least one fingerprinted source")
+        normalized_scope = tuple(sorted(set(source_scope)))
+        if not normalized_scope:
+            raise ValueError("A dialogue index requires a complete source inventory scope")
+        for relative_root, pattern in normalized_scope:
+            root_path = Path(relative_root)
+            if (root_path.is_absolute() or ".." in root_path.parts
+                    or not root_path.parts or not pattern or "/" in pattern
+                    or "\\" in pattern or not _has_pattern_literal(pattern)):
+                raise ValueError("Invalid source inventory root or filename pattern")
 
         contexts: dict[Identity, frozenset[DialogContext]] = {}
         for raw_identity, raw_contexts in references.items():
@@ -95,6 +108,7 @@ class DialogueIndex:
         frozen_contexts = MappingProxyType(dict(sorted(contexts.items())))
         object.__setattr__(self, "game_version", game_version)
         object.__setattr__(self, "source_fingerprint", source_fingerprint)
+        object.__setattr__(self, "source_scope", normalized_scope)
         object.__setattr__(self, "schema_version", schema_version)
         object.__setattr__(self, "_contexts", frozen_contexts)
         object.__setattr__(self, "digest", self._calculate_digest())
@@ -102,15 +116,25 @@ class DialogueIndex:
     @classmethod
     def from_validated_references(
             cls, game: GameInstallation, source_paths: Sequence[Path],
-            references: Mapping[tuple[str, str], Iterable[DialogContext]]) -> "DialogueIndex":
+            references: Mapping[tuple[str, str], Iterable[DialogContext]], *,
+            source_roots: Sequence[Path],
+            source_patterns: Sequence[str]) -> "DialogueIndex":
         """Create an index after a parser validates the reference schema.
 
-        This method fingerprints every parser input relative to the game root.
-        Callers are responsible for deriving ``references`` from those
-        structured inputs rather than from localized string wording.
+        Callers describe the complete set of relevant files using narrow
+        game-relative roots and filename-only glob patterns. The parsed input
+        paths must equal that complete inventory at build time. References
+        must come from structured inputs, never localized string wording.
         """
-        fingerprint = fingerprint_files(game.root, source_paths)
-        return cls(game.version, fingerprint, references)
+        scope = _normalize_source_scope(game, source_roots, source_patterns)
+        discovered = _enumerate_source_inventory(game, scope)
+        declared = _relative_source_paths(game, source_paths)
+        if discovered != declared:
+            raise ValueError(
+                "Parsed source paths do not match the complete scoped source inventory"
+            )
+        fingerprint = fingerprint_files(game.root, discovered)
+        return cls(game.version, fingerprint, references, scope)
 
     def _payload(self) -> dict[str, object]:
         return {
@@ -120,6 +144,7 @@ class DialogueIndex:
                 "entries": dict(sorted(self.source_fingerprint.entries.items())),
                 "digest": self.source_fingerprint.digest,
             },
+            "source_scope": [list(scope) for scope in self.source_scope],
             "contexts": [
                 {
                     "string_id": identity[0],
@@ -140,6 +165,7 @@ class DialogueIndex:
         return (
             self.schema_version == INDEX_SCHEMA_VERSION
             and bool(self.source_fingerprint.entries)
+            and bool(self.source_scope)
             and self.digest == self._calculate_digest()
         )
 
@@ -148,8 +174,11 @@ class DialogueIndex:
         if not self.validated or game.version != self.game_version:
             return False
         try:
-            current = fingerprint_files(game.root, tuple(self.source_fingerprint.entries))
-        except (OSError, ValueError):
+            current_paths = _enumerate_source_inventory(game, self.source_scope)
+            if current_paths != tuple(sorted(self.source_fingerprint.entries)):
+                return False
+            current = fingerprint_files(game.root, current_paths)
+        except (OSError, ValueError, UnicodeError):
             return False
         return current == self.source_fingerprint
 
@@ -163,6 +192,68 @@ class DialogueIndex:
         if len(contexts) != 1:
             return DialogContext.AMBIGUOUS
         return next(iter(contexts))
+
+
+def _normalize_source_scope(game: GameInstallation, roots: Sequence[Path],
+                            patterns: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    game_root = Path(game.root).resolve()
+    normalized_patterns = tuple(sorted(set(patterns)))
+    if not roots or not normalized_patterns:
+        raise ValueError("Source inventory requires at least one root and filename pattern")
+    if any(not pattern or "/" in pattern or "\\" in pattern
+           or not _has_pattern_literal(pattern) for pattern in normalized_patterns):
+        raise ValueError("Source inventory patterns must match filenames only")
+
+    scope = set()
+    for root in roots:
+        candidate = Path(root)
+        absolute = (candidate if candidate.is_absolute() else game_root / candidate).resolve()
+        relative = absolute.relative_to(game_root).as_posix()
+        if relative == ".":
+            raise ValueError("Source inventory roots must be narrower than the game root")
+        if not absolute.is_dir():
+            raise FileNotFoundError(f"Source inventory root is not a directory: {absolute}")
+        for pattern in normalized_patterns:
+            scope.add((relative, pattern))
+    return tuple(sorted(scope))
+
+
+def _has_pattern_literal(pattern: str) -> bool:
+    return any(character not in "*?[]" for character in pattern)
+
+
+def _relative_source_paths(game: GameInstallation, paths: Sequence[Path]) -> tuple[str, ...]:
+    game_root = Path(game.root).resolve()
+    relative = set()
+    for path in paths:
+        candidate = Path(path)
+        absolute = (candidate if candidate.is_absolute() else game_root / candidate).resolve()
+        relative.add(absolute.relative_to(game_root).as_posix())
+    return tuple(sorted(relative))
+
+
+def _enumerate_source_inventory(game: GameInstallation,
+                                scope: Sequence[tuple[str, str]]) -> tuple[str, ...]:
+    """Enumerate only parser-declared roots/patterns, failing on scan errors."""
+    game_root = Path(game.root).resolve()
+    discovered = set()
+
+    def raise_walk_error(error):
+        raise error
+
+    for relative_root, pattern in scope:
+        source_root = (game_root / relative_root).resolve()
+        source_root.relative_to(game_root)
+        if not source_root.is_dir():
+            raise FileNotFoundError(f"Source inventory root is not a directory: {source_root}")
+        for parent, _, names in os.walk(source_root, onerror=raise_walk_error,
+                                        followlinks=False):
+            for name in names:
+                if not fnmatch.fnmatchcase(name.casefold(), pattern.casefold()):
+                    continue
+                absolute = (Path(parent) / name).resolve()
+                discovered.add(absolute.relative_to(game_root).as_posix())
+    return tuple(sorted(discovered))
 
 
 def load_dialogue_index(game: GameInstallation) -> DialogueIndex | None:

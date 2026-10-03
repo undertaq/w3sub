@@ -61,7 +61,8 @@ class MergeTests(unittest.TestCase):
             "4|00000004||objective-alt\n5|00000005||ambiguous-alt\n6|00000006||hud-alt\n"
             "7|00000007||other-alt\n8|00000008||unknown-alt\n",
         )
-        source = self.root / "scene-references.json"
+        source = self.root / "structured" / "scene-references.json"
+        source.parent.mkdir()
         source.write_text('{"fixture": true}\n', encoding="utf-8")
         game = GameInstallation(
             self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
@@ -74,7 +75,7 @@ class MergeTests(unittest.TestCase):
             ("5", "00000005"): [DialogContext.SCENE_SUBTITLE, DialogContext.OVERHEAD],
             ("6", "00000006"): [DialogContext.HUD_UI],
             ("7", "00000007"): [DialogContext.OTHER],
-        })
+        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
 
         result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
                            index, current_game=game)
@@ -88,14 +89,15 @@ class MergeTests(unittest.TestCase):
 
     def test_stale_index_preserves_all_primary_rows(self):
         self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
-        source = self.root / "scene-references.json"
+        source = self.root / "structured" / "scene-references.json"
+        source.parent.mkdir()
         source.write_text("original source\n", encoding="utf-8")
         game = GameInstallation(
             self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
         )
         index = DialogueIndex.from_validated_references(game, [source], {
             ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-        })
+        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
         source.write_text("changed source\n", encoding="utf-8")
 
         result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
@@ -105,16 +107,36 @@ class MergeTests(unittest.TestCase):
 
     def test_index_without_current_game_preserves_primary_rows(self):
         self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
-        source = self.root / "scene-references.json"
+        source = self.root / "structured" / "scene-references.json"
+        source.parent.mkdir()
         source.write_text("unchanged source\n", encoding="utf-8")
         game = GameInstallation(
             self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
         )
         index = DialogueIndex.from_validated_references(game, [source], {
             ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-        })
+        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
 
         result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY, index)
+
+        self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||primary\n")
+
+    def test_added_reference_file_makes_dialogue_index_stale(self):
+        self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
+        source = self.root / "structured" / "scene-references.json"
+        source.parent.mkdir()
+        source.write_text("scene reference\n", encoding="utf-8")
+        game = GameInstallation(
+            self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
+        )
+        index = DialogueIndex.from_validated_references(game, [source], {
+            ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
+        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
+        added_reference = source.parent / "scene-references-extra.json"
+        added_reference.write_text("same ID also used for an item\n", encoding="utf-8")
+
+        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
+                           index, current_game=game)
 
         self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||primary\n")
 
