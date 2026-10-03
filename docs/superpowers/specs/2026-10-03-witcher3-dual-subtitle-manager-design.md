@@ -17,6 +17,9 @@ Steam App ID 292030, a Remastered app manifest, an executable reporting
 `ar`, `br`, `cn`, `cz`, `de`, `en`, `es`, `esmx`, `fr`, `hu`, `it`, `jp`,
 `kr`, `pl`, `ru`, `tr`, `ua`, and `zh`. These are discovery results, not a
 hard-coded promise that all future installations contain the same set.
+The verified local layout has `content/` and `dlc-tombstones/`, but no `dlc/`
+directory; the tombstone directory contains empty markers and is not a resource
+root. A base game without installed DLC remains valid, so `dlc/` is optional.
 
 ## Existing program
 
@@ -86,7 +89,8 @@ recommended for the first version.
 
 - `game_discovery`: validate the selected game root, identify the Remastered
   5.00 executable/layout, discover `.w3strings` language codes under `content`
-  and `dlc`, and inventory corresponding resource paths.
+  and under `dlc` when that directory exists, and inventory corresponding
+  resource paths. Do not treat `dlc-tombstones` as active resources.
 - `dialogue_classifier`: load or build a versioned map from localization IDs to
   their usage context in structured game resources. Classify in-dialogue scene
   subtitles separately from overhead/oneliner text, item names, HUD/UI text,
@@ -134,7 +138,9 @@ never used as scratch space.
 - Validate each candidate using the game's executable/version and required
   resource layout. Ignore stale entries and allow manual browsing if discovery
   does not produce a valid folder. Do not scan every drive by default.
-- Walk matching primary and secondary resource paths in `content` and `dlc`.
+- Walk matching primary and secondary resource paths in `content` and in `dlc`
+  when present. A missing `dlc` directory does not invalidate the base game;
+  `dlc-tombstones` is not an active resource directory.
 - Match CSV records by both string ID and key, preserving source ordering and
   comments where the converter format supports them.
 - For a matching record, write the primary string first and the secondary
@@ -248,7 +254,8 @@ before installation.
 
 - Reject paths without the expected game structure or a supported 5.00
   executable under `bin\x64` or `bin\x64_dx12`. Check the executable's reported
-  major/minor version as well as the required `content` and `dlc` structure.
+  major/minor version as well as the required `content` structure; `dlc` is
+  optional because the base game may not have DLC installed.
   Explain which check failed and let the user choose another path.
 - If a storefront registry record or install manifest is malformed,
   inaccessible, or points to a missing game folder, show the discovery issue
