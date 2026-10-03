@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Callable, Sequence
 
 from .models import GameInstallation, GameVersion, ResourceFingerprint, Storefront
@@ -53,7 +54,7 @@ def read_executable_version(path: Path) -> str:
                 language, codepage = translations[index * 2], translations[index * 2 + 1]
                 value, count = query(f"\\StringFileInfo\\{language:04x}{codepage:04x}\\{field}")
                 if value and count:
-                    text = ctypes.wstring_at(value, count).rstrip("\0").strip()
+                    text = ctypes.wstring_at(value, count).removesuffix("\0")
                     if text:
                         return text
     # Some executables have only the fixed resource. Retain all four words.
@@ -84,7 +85,7 @@ def scan_game(root: Path, storefront: Storefront, store_build_id: str | None = N
     raw_version = version
     # The shipped FileVersion appends '(Build Machine)'. Preserve every
     # numeric version component while excluding this non-version annotation.
-    match = re.fullmatch(r"((\d+)\.(\d+)\.\d+\.\d+)(?:\s*\([^()]*\))?", version)
+    match = re.fullmatch(r"((\d+)\.(\d+)\.\d+\.\d+)(?:\s*\([^()]*\))?", version.strip())
     if not match or (int(match[2]), int(match[3])) != (5, 0):
         raise ValueError(f"Unsupported executable version {version!r}; Remastered 5.0 is required")
     version = match[1]
@@ -94,9 +95,13 @@ def scan_game(root: Path, storefront: Storefront, store_build_id: str | None = N
         raise error
 
     for directory in (root / "content", root / "dlc"):
-        if not directory.exists():
-            continue
-        if not directory.is_dir():
+        try:
+            metadata = directory.stat()
+        except FileNotFoundError:
+            if directory == root / "dlc":
+                continue
+            raise
+        if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError(f"Resource root is not a directory: {directory}")
         directory.resolve().relative_to(root)
         for parent, _, names in os.walk(directory, onerror=fail, followlinks=False):

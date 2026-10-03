@@ -1,6 +1,10 @@
+import ctypes
+from ctypes import wintypes
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from w3sub_app import game
 from w3sub_app.models import Storefront
@@ -54,6 +58,47 @@ class GameTests(unittest.TestCase):
         result = self.scan("5.0.0.1044392(Build Machine)")
         self.assertEqual(result.version.executable_version, "5.0.0.1044392")
         self.assertEqual(result.version.executable_version_raw, "5.0.0.1044392(Build Machine)")
+
+    def test_native_resource_whitespace_preserved_in_raw_version(self):
+        self.asset("bin/x64/witcher3.exe")
+        raw = " \t5.0.0.1044392(Build Machine) \r\n"
+        resource = ctypes.create_unicode_buffer(raw)
+        translations = (wintypes.WORD * 2)(0x0409, 0x04b0)
+        api = Mock()
+        api.GetFileVersionInfoSizeW.return_value = 128
+        api.GetFileVersionInfoW.return_value = True
+
+        def query(buffer, key, pointer, length):
+            if key == r"\VarFileInfo\Translation":
+                value, count = translations, ctypes.sizeof(translations)
+            elif key == r"\StringFileInfo\040904b0\FileVersion":
+                value, count = resource, len(resource)
+            else:
+                return False
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.cast(value, ctypes.c_void_p).value
+            ctypes.cast(length, ctypes.POINTER(wintypes.UINT))[0] = count
+            return True
+
+        api.VerQueryValueW.side_effect = query
+        with patch.object(game.ctypes, "WinDLL", return_value=api):
+            result = game.scan_game(self.root, Storefront.UNKNOWN)
+        self.assertEqual(result.version.executable_version_raw, raw)
+        self.assertEqual(result.version.executable_version, "5.0.0.1044392")
+
+    def test_unreadable_optional_resource_root_is_not_omitted(self):
+        self.asset("bin/x64/witcher3.exe")
+        self.asset("content/en.w3strings")
+        self.asset("dlc/expansion/en.w3strings")
+        dlc = self.root / "dlc"
+        original_stat = os.stat
+        for error in (PermissionError(13, "Access denied"), OSError(5, "I/O error")):
+            def inaccessible(path, *args, **kwargs):
+                if Path(path) == dlc:
+                    raise error
+                return original_stat(path, *args, **kwargs)
+            with self.subTest(error=type(error).__name__), patch.object(os, "stat", inaccessible):
+                with self.assertRaises(type(error)):
+                    self.scan()
 
     def test_missing_required_content_or_executable_rejected(self):
         with self.assertRaises(FileNotFoundError):
