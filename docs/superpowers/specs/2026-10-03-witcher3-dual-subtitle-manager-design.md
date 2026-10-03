@@ -32,20 +32,36 @@ state or overwrite them.
 ## User flow
 
 1. Launch the desktop application.
-2. Choose or browse to the game root. Default the field to the known F: path
-   when it exists, otherwise ask the user to browse.
-3. Scan the installation. Show a clear result for supported version, detected
-   language codes, converter availability, and writable game/state locations.
+2. Find the default game folder from Windows/Steam registry data: read
+   `HKCU\Software\Valve\Steam\SteamPath`, falling back to
+   `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath` or
+   `HKLM\SOFTWARE\Valve\Steam\InstallPath`. Read the Steam client's
+   `steamapps/libraryfolders.vdf`, then locate App ID 292030's
+   `appmanifest_292030.acf` to resolve `installdir`. If more than one valid
+   installation is found, let the user select one. If registry-based discovery
+   fails, use a previously saved valid folder or ask the user to browse.
+3. On startup, detect the selected game's version and scan its resources.
+   Repeat detection and scanning immediately after the user selects another
+   game folder. Show the detected version, language codes, converter status,
+   and writable game/state locations.
 4. Select distinct primary and secondary languages from detected resources.
    Select either full-text combination or the existing dialogue-only mode.
 5. Generate to a staging directory and show progress and actionable errors.
+   Persist a generation record beside the staged output with the detected game
+   version and a fingerprint of all source resources used to generate it.
 6. Preview a concise summary of changed resource files and confirm install or
-   modify.
-7. Show the installed pair, game path, backup location, and available
+   modify. Before installation, re-detect the game version and source
+   fingerprints; require regeneration if the staged output is stale.
+7. Store the detected game version and source fingerprints with the active
+   install manifest. On startup and after folder selection, compare them with
+   the current game and determine whether regeneration is required.
+8. Show the installed pair, game path, backup location, and available
    Modify/Uninstall actions when the managed update is active.
 
 The game folder remains selectable so users can relocate their Steam library.
-The first supported target is the verified Remastered 5.00 Windows layout.
+The registry and Steam library metadata are discovery inputs, not the final
+authority: validate the resolved folder before accepting it. The first
+supported target is the verified Remastered 5.00 Windows layout.
 
 ## Approaches considered
 
@@ -68,7 +84,9 @@ recommended for the first version.
 
 - `game_discovery`: validate the selected game root, identify the Remastered
   5.00 executable/layout, discover `.w3strings` language codes under `content`
-  and `dlc`, and inventory corresponding resource paths.
+  and `dlc`, inventory corresponding resource paths, and locate candidate
+  Steam installs from registry values plus `libraryfolders.vdf` and app
+  manifests.
 - `converter`: invoke the bundled `w3strings.exe` with an argument list (never
   a shell command), capture output/exit status, and report decode/encode errors.
 - `merger`: read the converter's CSV representation, pair records by string ID
@@ -118,8 +136,43 @@ never used as scratch space.
 Managed state and exact original backups live outside the game directory under
 the current user's local application-data directory, keyed by a stable hash of
 the normalized game path. A manifest records the supported game identity,
-language pair, mode, each target relative path, original backup path and
-SHA-256, installed file SHA-256, and tool version.
+language pair, mode, game version at generation and install, Steam build ID
+when available, fingerprints of the primary and secondary source resource
+inventories, converter and application versions, each target relative path,
+original backup path and SHA-256, and installed file SHA-256.
+
+Keep a separate generation record beside staged outputs so their version and
+input fingerprints remain available before installation. When installing,
+copy that generation snapshot into the install manifest and record the version
+detected immediately before files are changed as the install version.
+
+The game version identity includes the executable's reported file/product
+version and the Steam build ID when the app manifest provides one. Resource
+fingerprints include relative paths and SHA-256 hashes for every primary and
+secondary `.w3strings` input used by the generated output, including additions
+or removals from either inventory.
+
+At startup and after a game folder is selected, compare the detected version
+with the version recorded for the current generated output and active install.
+If the version differs, compare the input resource inventories and hashes. If
+any relevant resource was added, removed, or changed, mark the output stale,
+explain that the dual subtitle files need regeneration, and disable Install or
+Modify. If there is no active installation, allow the user to regenerate. If
+there is an active installation and its target hashes still match the
+manifest, allow uninstall first, then regenerate from the restored updated
+baseline. If only the executable/build metadata changed and every relevant
+language resource fingerprint is identical, report that the output remains
+compatible and allow the user to proceed. If inputs cannot be read or
+compared, treat the output as stale. Before install, repeat this check to catch
+an update that happened while the app was open.
+
+For an active install after a game update, first verify managed target hashes.
+If the source fingerprint changed, mark the active update stale. When its
+installed files still match the manifest, require uninstall/restoration before
+generating against the updated baseline. If the update or another tool replaced
+any managed file, mark the installation conflicted, list the affected files,
+and do not overwrite them; provide the saved backup location for manual
+resolution before allowing regeneration or another install.
 
 Install flow:
 
@@ -161,6 +214,10 @@ before installation.
   executable under `bin\x64` or `bin\x64_dx12`. Check the executable's reported
   major/minor version as well as the required `content` and `dlc` structure.
   Explain which check failed and let the user choose another path.
+- If Steam registry or library metadata is malformed, inaccessible, or points
+  to a missing game folder, show the discovery issue and allow manual browsing.
+- If the game version or source fingerprint changes between generation and
+  install, stop and request regeneration before touching game files.
 - Reject incomplete language pairs, missing converter, malformed CSV, duplicate
   records that cannot be paired unambiguously, and any failed converter exit.
 - Disable install until staging and validation complete.
@@ -174,6 +231,11 @@ before installation.
 
 - The app starts as a GUI and can browse to and validate the known F: Remastered
   5.00 installation.
+- Startup discovery reads the Steam client registry path and library metadata,
+  resolves App ID 292030 to the F: installation, and falls back to manual
+  browsing when discovery cannot produce a valid game folder.
+- The app detects game version both on startup and immediately after a folder
+  is selected, and displays the result.
 - The language selectors are populated from discovered usable game assets,
   not a fixed `zh`/`en` pair.
 - A chosen primary/secondary pair produces correctly ordered dual text in
@@ -182,6 +244,14 @@ before installation.
 - Full-text and dialogue-only modes are selectable and reflected in generated
   output.
 - Install makes a verified backup and a manifest before changing any file.
+- Generation and install metadata include the game version, Steam build ID when
+  available, and fingerprints of the language resources used.
+- If a game upgrade changes any source language resource or its inventory, the
+  app identifies the generated files as stale and requires regeneration before
+  install/modify. If a managed install is active, the app requires uninstall
+  before regenerating against the updated baseline. If only version metadata
+  changed while all source resources remain byte-identical, the app reports
+  that regeneration is unnecessary.
 - Modify changes the selected pair using the original baseline without stacking
   text.
 - Uninstall restores byte-identical originals.
