@@ -72,11 +72,12 @@ class DialogueIndexTests(unittest.TestCase):
         self.assertNotEqual(scene.digest, overhead.digest)
         self.assertNotEqual(scene.digest, other_version.digest)
 
-    def test_source_fingerprint_or_game_version_mismatch_is_stale(self):
+    def test_metadata_version_changes_preserve_index_but_source_changes_invalidate_it(self):
         index = self.make_index({("100", "A001"): [DialogContext.SCENE_SUBTITLE]})
 
         self.assertTrue(index.is_current(self.game))
-        self.assertFalse(index.is_current(self.make_game("5.0.0.1044393")))
+        self.assertTrue(index.is_current(self.make_game("5.0.0.1044393")))
+        self.assertFalse(index.is_current(self.make_game("6.0.0.1044393")))
         self.source.write_text('{"fixture": changed}\n', encoding="utf-8")
         self.assertFalse(index.is_current(self.game))
 

@@ -2,11 +2,12 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from w3sub_app import generation
-from w3sub_app.dialogue_index import DialogContext
+from w3sub_app.dialogue_index import DialogContext, DialogueIndex
 from w3sub_app.generation import GenerationError, compare_generation, generate
 from w3sub_app.models import (
     Freshness,
@@ -122,6 +123,7 @@ class GenerationTests(unittest.TestCase):
         })
         metadata_path = output.parents[2] / "generation.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["generation_dir"], str(record.generation_dir))
         self.assertEqual(metadata["game_version"]["executable_version_raw"],
                          "5.0.0.1044392(Build Machine)")
         self.assertEqual(metadata["game_version"]["store_build_id"], "build-1")
@@ -202,6 +204,34 @@ class GenerationTests(unittest.TestCase):
                 generate(self.request(mode=MergeMode.DIALOGUE_ONLY),
                          self.state_root, self.converter)
 
+    def test_real_dialogue_index_survives_same_supported_build_metadata_and_stays_metadata_only(self):
+        source = self.game_root / "structured" / "scene-references.json"
+        source.parent.mkdir(parents=True)
+        source.write_text('{"fixture": true}\n', encoding="utf-8")
+        index = DialogueIndex.from_validated_references(
+            self.game,
+            [source],
+            {("1", "00000001"): [DialogContext.SCENE_SUBTITLE]},
+            source_roots=[source.parent],
+            source_patterns=["scene-*.json"],
+        )
+        updated_game = GameInstallation(
+            self.game.root,
+            self.game.storefront,
+            GameVersion("5.0.0.1044393", "build-2", "5.0.0.1044393 (updated)"),
+            self.game.language_files,
+        )
+
+        self.assertTrue(index.is_current(updated_game))
+        with patch.object(generation, "load_dialogue_index", return_value=index):
+            record = generate(self.request(mode=MergeMode.DIALOGUE_ONLY),
+                              self.state_root, self.converter)
+        self.assertEqual(record.game_version, self.game.version)
+        self.assertEqual(record.classifier_digest, index.digest)
+        with patch.object(generation, "load_dialogue_index", return_value=index):
+            self.assertEqual(compare_generation(record, updated_game),
+                             Freshness.VERSION_METADATA_CHANGED_ONLY)
+
     def test_modify_overrides_are_used_and_fingerprinted_by_game_relative_path(self):
         primary_target = "content/content0/en.w3strings"
         original = self.base / "backup" / "en.w3strings"
@@ -215,6 +245,44 @@ class GenerationTests(unittest.TestCase):
                          hashlib.sha256(original.read_bytes()).hexdigest())
         self.assertEqual(compare_generation(record, self.game, overrides), Freshness.CURRENT)
         self.assertEqual(compare_generation(record, self.game), Freshness.STALE)
+
+    def test_modify_can_restore_a_secondary_input_from_a_prior_dual_install(self):
+        secondary = self.game.language_files["zh"][0]
+        secondary.write_text("1|00000001||zh previous<br>en previous\n", encoding="utf-8")
+        backup = self.base / "backup" / "zh.w3strings"
+        backup.parent.mkdir()
+        backup.write_text("1|00000001||zh baseline\n", encoding="utf-8")
+        relative = "content/content0/zh.w3strings"
+        overrides = {relative: backup}
+
+        record = generate(self.request(overrides=overrides), self.state_root, self.converter)
+        output = Path(record.output_files["content/content0/en.w3strings"])
+        merged_text = output.read_text(encoding="utf-8")
+
+        self.assertEqual(merged_text, "1|00000001||en text<br>zh baseline\n")
+        self.assertEqual(merged_text.count("<br>"), 1)
+        self.assertEqual(record.source_fingerprint.entries[relative],
+                         hashlib.sha256(backup.read_bytes()).hexdigest())
+        self.assertEqual(compare_generation(record, self.game, overrides), Freshness.CURRENT)
+        self.assertEqual(compare_generation(record, self.game), Freshness.STALE)
+
+    def test_generation_output_paths_must_match_their_relative_keys_and_directory(self):
+        record = generate(self.request(), self.state_root, self.converter)
+        key = "content/content0/en.w3strings"
+        output = Path(record.output_files[key])
+        escaped = self.base / "outside.w3strings"
+        escaped.write_bytes(output.read_bytes())
+
+        escaped_record = replace(record, output_files={key: str(escaped)})
+        self.assertEqual(compare_generation(escaped_record, self.game), Freshness.STALE)
+
+        mismatched_key = "content/content0/zh.w3strings"
+        mismatched_record = replace(
+            record,
+            output_files={mismatched_key: str(output)},
+            output_hashes={mismatched_key: record.output_hashes[key]},
+        )
+        self.assertEqual(compare_generation(mismatched_record, self.game), Freshness.STALE)
 
     def test_game_or_source_update_after_generation_is_detected_before_install(self):
         record = generate(self.request(), self.state_root, self.converter)

@@ -109,9 +109,7 @@ def _source_paths(game: GameInstallation, primary_language: str,
     primary_resources = _resource_map(game, primary_language)
     secondary_resources = _resource_map(game, secondary_language)
     sources = {}
-    primary_paths = set()
     for _, primary_rel, secondary_rel in pairs:
-        primary_paths.add(primary_rel)
         sources[primary_rel] = primary_resources[primary_rel]
         sources[secondary_rel] = secondary_resources[secondary_rel]
 
@@ -122,12 +120,10 @@ def _source_paths(game: GameInstallation, primary_language: str,
             if key in overrides:
                 raise GenerationError(f"Duplicate source override path: {key}")
             overrides[key] = Path(raw_path)
-        if overrides.keys() != primary_paths:
-            missing = sorted(primary_paths - overrides.keys())
-            unexpected = sorted(overrides.keys() - primary_paths)
+        unexpected = sorted(overrides.keys() - sources.keys())
+        if unexpected:
             raise GenerationError(
-                "Modify source overrides must cover every primary resource exactly "
-                f"(missing {missing}; unexpected {unexpected})"
+                f"Source overrides must target selected language resources: {unexpected}"
             )
         for relative, source in overrides.items():
             # The physical backup may live outside the game; its fingerprint
@@ -204,6 +200,7 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "schema_version": GENERATION_RECORD_SCHEMA,
         "generation_id": record.generation_id,
         "game_root": str(record.game_root),
+        "generation_dir": str(record.generation_dir),
         "storefront": record.storefront.value,
         "game_version": _version_payload(record.game_version),
         "primary_language": record.primary_language,
@@ -317,6 +314,7 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
         record = GenerationRecord(
             generation_id=generation_id,
             game_root=root,
+            generation_dir=generation_dir.resolve(),
             storefront=request.game.storefront,
             game_version=request.game.version,
             primary_language=primary_language,
@@ -344,12 +342,72 @@ def generate(request: GenerationRequest, state_root: Path, converter) -> Generat
         raise GenerationError(f"Generation failed: {error}") from error
 
 
-def _verify_outputs(record: GenerationRecord) -> bool:
+def _generation_directory(record: GenerationRecord, game_root: Path) -> Path | None:
+    raw_directory = Path(record.generation_dir)
+    if not raw_directory.is_absolute():
+        return None
+    try:
+        directory = raw_directory.resolve(strict=True)
+        if raw_directory != directory:
+            return None
+    except OSError:
+        return None
+
+    root = _normalized_game_root(game_root)
+    if directory.name != record.generation_id:
+        return None
+    generations = directory.parent
+    game_state = generations.parent
+    games = game_state.parent
+    if (generations.name != "generations"
+            or game_state.name != _game_root_hash(root)
+            or games.name != "games"):
+        return None
+    try:
+        directory.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        return None
+    return directory
+
+
+def _safe_relative_output(relative: str) -> tuple[str, ...] | None:
+    if not isinstance(relative, str) or not relative:
+        return None
+    posix = PurePosixPath(relative)
+    windows = PureWindowsPath(relative)
+    if (posix.is_absolute() or windows.is_absolute() or windows.drive
+            or ".." in posix.parts or "." in posix.parts
+            or posix.as_posix() != relative or "\\" in relative):
+        return None
+    return posix.parts
+
+
+def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
     if not record.output_files or record.output_files.keys() != record.output_hashes.keys():
         return False
+    generation_dir = _generation_directory(record, game_root)
+    if generation_dir is None:
+        return False
     for relative, raw_path in record.output_files.items():
+        parts = _safe_relative_output(relative)
+        if parts is None:
+            return False
+        expected = generation_dir.joinpath(*parts)
         try:
-            if _hash_file(Path(raw_path)) != record.output_hashes[relative]:
+            actual_path = Path(raw_path)
+            if not actual_path.is_absolute():
+                return False
+            actual = actual_path.resolve(strict=True)
+            expected = expected.resolve(strict=True)
+            if actual != expected:
+                return False
+            try:
+                actual.relative_to(generation_dir)
+            except ValueError:
+                return False
+            if _hash_file(expected) != record.output_hashes[relative]:
                 return False
         except OSError:
             return False
@@ -371,7 +429,7 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
         return Freshness.STALE
     if current_fingerprint != record.source_fingerprint:
         return Freshness.STALE
-    if not _verify_outputs(record):
+    if not _verify_outputs(record, game.root):
         return Freshness.STALE
     if game.storefront is not record.storefront:
         return Freshness.STALE

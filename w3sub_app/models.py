@@ -65,6 +65,7 @@ class ResourceFingerprint:
 class GenerationRecord:
     generation_id: str
     game_root: Path
+    generation_dir: Path
     storefront: Storefront
     game_version: GameVersion
     primary_language: str

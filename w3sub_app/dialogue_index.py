@@ -31,6 +31,7 @@ from .models import GameInstallation, GameVersion, ResourceFingerprint
 
 
 INDEX_SCHEMA_VERSION = 1
+SUPPORTED_GAME_MAJOR_MINOR = (5, 0)
 
 
 class DialogContext(Enum):
@@ -61,6 +62,14 @@ def _version_payload(version: GameVersion) -> dict[str, str | None]:
         "executable_version_raw": version.executable_version_raw,
         "store_build_id": version.store_build_id,
     }
+
+
+def _supported_major_minor(version: GameVersion) -> tuple[int, int] | None:
+    match = re.match(r"^(\d+)\.(\d+)\.", version.executable_version)
+    if not match:
+        return None
+    major_minor = (int(match[1]), int(match[2]))
+    return major_minor if major_minor == SUPPORTED_GAME_MAJOR_MINOR else None
 
 
 @dataclass(frozen=True, init=False)
@@ -170,8 +179,16 @@ class DialogueIndex:
         )
 
     def is_current(self, game: GameInstallation) -> bool:
-        """Check both the exact executable/store version and source bytes."""
-        if not self.validated or game.version != self.game_version:
+        """Check supported major/minor compatibility and exact source bytes.
+
+        Executable revision, raw version string, and storefront build metadata
+        may change without invalidating the index, provided both game versions
+        remain in the supported major/minor and its complete scoped reference
+        inventory and hashes are unchanged.
+        """
+        if (not self.validated
+                or _supported_major_minor(self.game_version) is None
+                or _supported_major_minor(game.version) != _supported_major_minor(self.game_version)):
             return False
         try:
             current_paths = _enumerate_source_inventory(game, self.source_scope)
