@@ -16,6 +16,13 @@ class MergeMode(Enum):
     DIALOGUE_ONLY = "dialogue_only"
 
 
+class Freshness(Enum):
+    CURRENT = "current"
+    VERSION_METADATA_CHANGED_ONLY = "version_metadata_changed_only"
+    STALE = "stale"
+    UNREADABLE = "unreadable"
+
+
 @dataclass(frozen=True)
 class GameCandidate:
     root: Path
@@ -40,6 +47,34 @@ class GameInstallation:
 
 
 @dataclass(frozen=True)
+class GenerationRequest:
+    game: GameInstallation
+    primary_language: str
+    secondary_language: str
+    mode: MergeMode
+    source_overrides: dict[str, Path] | None = None
+
+
+@dataclass(frozen=True)
 class ResourceFingerprint:
     entries: dict[str, str]
     digest: str
+
+
+@dataclass(frozen=True)
+class GenerationRecord:
+    generation_id: str
+    game_root: Path
+    storefront: Storefront
+    game_version: GameVersion
+    primary_language: str
+    secondary_language: str
+    mode: MergeMode
+    source_fingerprint: ResourceFingerprint
+    classifier_digest: str | None
+    converter_path: str
+    converter_sha256: str
+    converter_version: str | None
+    app_version: str
+    output_files: dict[str, str]
+    output_hashes: dict[str, str]
