@@ -155,12 +155,12 @@ class GenerationRecord:
 - Consumes `GameCandidate` from Task 1.
 - Produces `scan_game(root: Path, storefront: Storefront, store_build_id: str | None = None, version_reader: VersionReader | None = None) -> GameInstallation`, `find_game_executable(root: Path) -> Path`, and `fingerprint_files(root: Path, paths: Sequence[Path]) -> ResourceFingerprint`.
 
-- [ ] **Step 1: Add tests** for `bin\x64` and `bin\x64_dx12`, accepting a 5.0 executable, rejecting Classic 1.32 and 4.x, extracting all language codes from present `.w3strings` assets, and hashing a path inventory deterministically. Inject `version_reader` so version rules do not depend on the host game install.
+- [ ] **Step 1: Add tests** for `bin\x64` and `bin\x64_dx12`, accepting a 5.0 executable, rejecting Classic 1.32 and 4.x, extracting all language codes from present `.w3strings` assets, retaining an optional passed `store_build_id`, and hashing a path inventory deterministically. Inject `version_reader` so version rules do not depend on the host game install.
 - [ ] **Step 2: Run the focused tests and confirm they fail.**
 
   Run: `python -m unittest tests.test_game -v`
 
-- [ ] **Step 3: Implement executable version reading** with the Windows version-information API via `ctypes`; retain the full file/product version string. Read Steam `buildid`, GOG version/build values, or Epic `AppVersion` when available and store as an optional `store_build_id`.
+- [ ] **Step 3: Implement executable version reading** with the Windows version-information API via `ctypes`; retain the full file/product version string. Carry the optional `store_build_id` passed from `GameCandidate` into `GameVersion`; Task 1 storefront readers own parsing Steam `buildid`, GOG version/build values, and Epic `AppVersion` when available.
 - [ ] **Step 4: Implement root scanning.** Require `content` and Remastered 5.0 major/minor; prefer the `bin\x64_dx12\witcher3.exe` target when both supported executables exist, then `bin\x64\witcher3.exe`. Inventory `.w3strings` basenames under `content` and under `dlc` when present; do not scan `dlc-tombstones`. Return language-to-path tuples sorted by relative path.
 - [ ] **Step 5: Implement deterministic fingerprints** over the sorted relative paths and file bytes, recording per-file SHA-256 plus an aggregate digest. Fail if any input cannot be read; never report a partial fingerprint as valid.
 - [ ] **Step 6: Run the focused tests**, then scan the known F: installation and confirm it reports version `5.0.0.1044392` and the locally observed language set.
