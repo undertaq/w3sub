@@ -1,4 +1,5 @@
 """Stage dual-language resources and retain the inputs needed to audit them."""
+import csv
 import hashlib
 import json
 import os
@@ -8,7 +9,14 @@ import uuid
 import shutil
 
 from .dialogue_index import INDEX_SCHEMA_VERSION, load_dialogue_index
-from .merge import MergeError, merge_csv, merge_records
+from .merge import (
+    MergeError,
+    MergeStats,
+    merge_csv,
+    merge_records,
+    unmatched_csv_entries,
+    unmatched_native_entries,
+)
 from .converter import check_compatibility
 from .w3strings_native import NativeW3StringsCodec
 from .models import (
@@ -23,7 +31,7 @@ from .models import (
 )
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 GENERATION_RECORD_SCHEMA = 1
 
 
@@ -199,6 +207,29 @@ def _fingerprint_payload(fingerprint: ResourceFingerprint) -> dict[str, object]:
     return {"entries": dict(sorted(fingerprint.entries.items())), "digest": fingerprint.digest}
 
 
+def _write_unmatched_report(path: Path, rows: list[tuple[str, ...]]) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8-sig", newline="", prefix=".unmatched-",
+                suffix=".tmp", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            writer = csv.writer(handle)
+            writer.writerow(("resource", "language", "side", "string_id",
+                             "key_hash_hex", "text", "reason"))
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except (OSError, csv.Error, UnicodeError) as error:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise GenerationError(f"Cannot write unmatched entries report: {error}") from error
+
+
 def _record_payload(record: GenerationRecord) -> dict[str, object]:
     return {
         "schema_version": GENERATION_RECORD_SCHEMA,
@@ -220,6 +251,9 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "app_version": record.app_version,
         "output_files": dict(sorted(record.output_files.items())),
         "output_hashes": dict(sorted(record.output_hashes.items())),
+        "total_entries": record.total_entries,
+        "merged_entries": record.merged_entries,
+        "unmatched_entries_count": record.unmatched_entries_count,
     }
 
 
@@ -247,17 +281,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
     except (OSError, ValueError) as error:
         raise GenerationError(f"Cannot fingerprint generation inputs: {error}") from error
 
-    dialogue_index = None
     classifier_digest = None
     classifier_schema = None
-    if request.mode is MergeMode.DIALOGUE_ONLY:
-        dialogue_index = _current_dialogue_index(request.game)
-        if dialogue_index is None:
-            raise GenerationError(
-                "Dialogue-only generation requires a current validated dialogue index"
-            )
-        classifier_digest = dialogue_index.digest
-        classifier_schema = dialogue_index.schema_version
 
     converter_path, converter_digest = _hash_executable(converter)
     converter_version = getattr(converter, "version", None)
@@ -278,6 +303,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
     generation_dir.mkdir()
     output_files = {}
     output_hashes = {}
+    merge_stats = MergeStats()
+    unmatched_report_rows = []
 
     try:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
@@ -294,18 +321,32 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
                     raise GenerationError(f"Native codec compatibility check failed: {report.error}")
             else:
                 copied_sources = sources
-            for number, (_, primary_relative, secondary_relative) in enumerate(pairs):
+            for number, (_resource_parent, primary_relative, secondary_relative) in enumerate(pairs):
                 primary_csv = converter.decode(copied_sources[primary_relative],
                                                scratch / f"{number}-primary")
                 secondary_csv = converter.decode(copied_sources[secondary_relative],
                                                  scratch / f"{number}-secondary")
+                unmatched = (unmatched_native_entries(primary_csv, secondary_csv) if native else
+                             unmatched_csv_entries(primary_csv, secondary_csv))
+                for entry in unmatched:
+                    language = (primary_language if entry.side == "primary"
+                                else secondary_language)
+                    resource = (primary_relative if entry.side == "primary"
+                                else secondary_relative)
+                    unmatched_report_rows.append((
+                        resource, language, entry.side, entry.string_id,
+                        entry.key_hash_hex, entry.text, entry.reason,
+                    ))
                 try:
                     merged_csv = (merge_records if native else merge_csv)(
                         primary_csv,
                         secondary_csv,
                         request.mode,
-                        dialogue_index=dialogue_index,
+                        dialogue_index=None,
                         current_game=request.game,
+                        stats=merge_stats,
+                        primary_language=primary_language,
+                        secondary_language=secondary_language,
                     )
                 except MergeError as error:
                     raise GenerationError(f"Cannot merge {primary_relative}: {error}") from error
@@ -324,17 +365,12 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
             raise GenerationError(f"Cannot recheck generation inputs: {error}") from error
         if final_fingerprint != initial_fingerprint:
             raise GenerationError("A language resource changed during generation; retry")
-        if request.mode is MergeMode.DIALOGUE_ONLY:
-            current_index = _current_dialogue_index(request.game)
-            if (current_index is None or current_index.digest != classifier_digest
-                    or current_index.schema_version != classifier_schema):
-                raise GenerationError(
-                    "The dialogue index changed during generation; retry with a current index"
-                )
         current_converter_path, final_converter_digest = _hash_executable(converter)
         if current_converter_path != converter_path or final_converter_digest != converter_digest:
             raise GenerationError("Converter executable changed during generation; retry")
 
+        unmatched_report = generation_dir / "unmatched_entries.csv"
+        _write_unmatched_report(unmatched_report, unmatched_report_rows)
         record = GenerationRecord(
             generation_id=generation_id,
             game_root=root,
@@ -354,6 +390,9 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
             output_hashes=output_hashes,
             codec_kind="native" if native else "external",
             classifier_schema_version=classifier_schema,
+            total_entries=merge_stats.total_entries,
+            merged_entries=merge_stats.merged_entries,
+            unmatched_entries_count=len(unmatched_report_rows),
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -373,6 +412,18 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         raise ValueError("unsupported generation record schema")
     if payload.get("codec_kind", "external") not in ("native", "external"):
         raise ValueError("unsupported generation codec kind")
+    total_entries = payload.get("total_entries")
+    merged_entries = payload.get("merged_entries")
+    unmatched_entries_count = payload.get("unmatched_entries_count")
+    if total_entries is None and merged_entries is None:
+        # Older generation records predate merge statistics.
+        pass
+    elif (type(total_entries) is not int or type(merged_entries) is not int
+          or total_entries < 0 or merged_entries < 0 or merged_entries > total_entries):
+        raise ValueError("generation record merge statistics are malformed")
+    if (unmatched_entries_count is not None
+            and (type(unmatched_entries_count) is not int or unmatched_entries_count < 0)):
+        raise ValueError("generation record unmatched count is malformed")
     classifier_schema = payload.get("classifier_schema_version")
     if classifier_schema is not None and (type(classifier_schema) is not int or classifier_schema < 1):
         raise ValueError("invalid classifier schema version")
@@ -438,6 +489,9 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         output_hashes=dict(output_hashes),
         codec_kind=payload.get("codec_kind", "external"),
         classifier_schema_version=classifier_schema,
+        total_entries=total_entries,
+        merged_entries=merged_entries,
+        unmatched_entries_count=unmatched_entries_count,
     )
     return record
 
@@ -570,8 +624,10 @@ def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
 
 def compare_generation(record: GenerationRecord, game: GameInstallation,
                        source_overrides: dict[str, Path] | None = None) -> Freshness:
-    """Compare staged inputs and classifier with a freshly scanned install."""
+    """Compare staged inputs and outputs with a freshly scanned install."""
     if _normalized_game_root(record.game_root) != _normalized_game_root(game.root):
+        return Freshness.STALE
+    if record.app_version != APP_VERSION:
         return Freshness.STALE
     try:
         sources = _source_paths(game, record.primary_language,
@@ -595,17 +651,6 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
         if record.converter_sha256 != current_codec_digest:
             return Freshness.STALE
     if game.storefront is not record.storefront:
-        return Freshness.STALE
-
-    if record.mode is MergeMode.DIALOGUE_ONLY:
-        try:
-            index = _current_dialogue_index(game)
-        except OSError:
-            return Freshness.UNREADABLE
-        if (index is None or index.digest != record.classifier_digest
-                or index.schema_version != record.classifier_schema_version):
-            return Freshness.STALE
-    elif record.classifier_digest is not None:
         return Freshness.STALE
 
     if game.version != record.game_version:

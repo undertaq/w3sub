@@ -61,6 +61,15 @@ class GameSnapshot:
     dialogue_index_reason: str = ""
 
 
+def _merge_summary(record: GenerationRecord) -> str | None:
+    total = record.total_entries
+    merged = record.merged_entries
+    if total is None or merged is None:
+        return None
+    ratio = merged * 100 / total if total else 0.0
+    return f"Merged {merged:,} of {total:,} entries ({ratio:.1f}%)"
+
+
 def _path_identity(path: Path) -> str:
     try:
         resolved = Path(path).expanduser().resolve(strict=False)
@@ -190,10 +199,9 @@ def build_action_state(*, has_game: bool, primary: str | None, secondary: str | 
         Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY,
     )
     pair_valid = bool(primary and secondary and primary.casefold() != secondary.casefold())
-    mode_ready = mode is MergeMode.FULL_TEXT or dialogue_index_current
     safe_to_generate = not conflicts and not active_stale
     can_generate = bool(has_game and pair_valid and resources_available
-                        and converter_compatible and mode_ready and safe_to_generate)
+                        and converter_compatible and safe_to_generate)
     fresh_generation = generation_freshness in (
         Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY,
     )
@@ -203,10 +211,10 @@ def build_action_state(*, has_game: bool, primary: str | None, secondary: str | 
     can_modify = bool(has_game and generation_ready and install_active
                       and not conflicts and not active_stale)
     can_uninstall = bool(has_game and install_active and not conflicts)
-    reason = ("No validated structured dialogue-reference index is available; "
-              "dialogue-only mode is disabled. Full-text mode remains available.")
+    reason = ("Dialogue-only merges entries with no key hash in both languages, "
+              "matched by string ID.")
     return ActionState(can_generate, can_install, can_modify, can_uninstall,
-                       bool(has_game and dialogue_index_current), "\n".join(conflicts), reason)
+                       bool(has_game), "\n".join(conflicts), reason)
 
 
 def default_converter_path() -> Path:
@@ -422,7 +430,7 @@ class W3DualSubtitleApp:
         )
         self.dialogue_mode.grid(row=0, column=1, sticky="w", padx=12)
         self.index_build_button = ttk.Button(
-            mode, text="Build/Refresh Dialogue Index", command=self._build_dialogue_index,
+            mode, text="Build optional Dialogue Index", command=self._build_dialogue_index,
         )
         self.index_build_button.grid(row=0, column=2, sticky="w")
         self.index_status_var = tk.StringVar(value="Dialogue index: missing")
@@ -436,6 +444,11 @@ class W3DualSubtitleApp:
         actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(5, 7))
         self.generate_button = ttk.Button(actions, text="Generate preview", command=self._generate_preview)
         self.generate_button.pack(side="left", padx=(0, 6))
+        self.unmatched_button = ttk.Button(
+            actions, text="Open unmatched list", command=self._open_unmatched_entries,
+            state="disabled",
+        )
+        self.unmatched_button.pack(side="left", padx=6)
         self.install_button = ttk.Button(actions, text="Install", command=self._install)
         self.install_button.pack(side="left", padx=6)
         self.modify_button = ttk.Button(actions, text="Modify install", command=self._modify)
@@ -535,7 +548,8 @@ class W3DualSubtitleApp:
         state = "normal" if enabled else "disabled"
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
                        self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
-                       self.full_mode, self.dialogue_mode, self.rescan_button, self.index_build_button):
+                       self.full_mode, self.dialogue_mode, self.rescan_button, self.index_build_button,
+                       self.unmatched_button):
             try:
                 widget.configure(state=state)
             except tk.TclError:
@@ -545,8 +559,10 @@ class W3DualSubtitleApp:
             self.primary_combo.configure(state="readonly")
             self.secondary_combo.configure(state="readonly")
             self.converter_entry.configure(state="readonly")
-            if not self.snapshot or not self.snapshot.dialogue_index_available:
-                self.dialogue_mode.configure(state="disabled")
+            self.dialogue_mode.configure(state="normal" if self.snapshot else "disabled")
+            self.unmatched_button.configure(
+                state="normal" if self._unmatched_report_path() else "disabled"
+            )
 
     def _startup_scan(self):
         candidates = storefronts.discover_candidates()
@@ -668,11 +684,12 @@ class W3DualSubtitleApp:
         self.primary_var.set(primary)
         self.secondary_var.set(secondary)
         self.mode_reason_var.set(
-            "" if snapshot.dialogue_index_available else snapshot.dialogue_index_reason
+            "Dialogue-only uses entries with no key hash in both languages, matched by string ID. "
+            "Merged text uses <br> after terminal punctuation; otherwise it uses a space."
         )
-        self.index_status_var.set("Dialogue index: " + (
+        self.index_status_var.set("Optional index: " + (
             "Ready" if snapshot.dialogue_index_available else snapshot.dialogue_index_state.capitalize()))
-        self.dialogue_mode.configure(state="normal" if snapshot.dialogue_index_available else "disabled")
+        self.dialogue_mode.configure(state="normal")
         self._render_generation_and_install()
         self._set_candidate_values()
         self._refresh_action_buttons()
@@ -681,6 +698,14 @@ class W3DualSubtitleApp:
         for item in self.preview.get_children():
             self.preview.delete(item)
         snapshot = self.snapshot
+        self.unmatched_button.configure(
+            state="normal" if self._unmatched_report_path() else "disabled"
+        )
+        record = snapshot.generation_record if snapshot else None
+        unmatched_count = (record.unmatched_entries_count
+                           if record and record.unmatched_entries_count is not None else None)
+        merge_summary = (_merge_summary(snapshot.generation_record)
+                         if snapshot and snapshot.generation_record else None)
         if snapshot and snapshot.generation_record:
             record = snapshot.generation_record
             freshness_label = (snapshot.generation_freshness.value.replace("_", " ")
@@ -701,6 +726,9 @@ class W3DualSubtitleApp:
                 f"Generation {record.generation_id}: "
                 f"{freshness_label}; "
                 f"{record.primary_language} + {record.secondary_language}; {record.mode.value}"
+                + (f"; {merge_summary}" if merge_summary else "")
+                + (f"; {record.unmatched_entries_count:,} unmatched identities"
+                   if record.unmatched_entries_count is not None else "")
             )
         if snapshot and snapshot.manifest and snapshot.manifest.active:
             manifest = snapshot.manifest
@@ -709,6 +737,9 @@ class W3DualSubtitleApp:
                 self.status_var.set(
                     f"Install conflicts: {', '.join(comparison.conflict_paths)}; "
                     f"originals backed up at {manifest.backup_directory}"
+                    + (f"; {merge_summary}" if merge_summary else "")
+                    + (f"; {unmatched_count:,} unmatched identities"
+                       if unmatched_count is not None else "")
                 )
             else:
                 freshness = (comparison.freshness.value.replace("_", " ")
@@ -716,6 +747,9 @@ class W3DualSubtitleApp:
                 self.status_var.set(
                     f"Active install {manifest.primary_language} + {manifest.secondary_language}; "
                     f"{freshness}; originals at {manifest.backup_directory}"
+                    + (f"; {merge_summary}" if merge_summary else "")
+                    + (f"; {unmatched_count:,} unmatched identities"
+                       if unmatched_count is not None else "")
                 )
 
     def _candidate_changed(self, _event=None):
@@ -875,8 +909,7 @@ class W3DualSubtitleApp:
         self.index_build_button.configure(state="normal" if snapshot and not self._busy else "disabled")
         self.full_mode.configure(state="normal" if pairable and not self._busy else "disabled")
         self.dialogue_mode.configure(
-            state="normal" if pairable and snapshot and snapshot.dialogue_index_available
-            and not self._busy else "disabled"
+            state="normal" if pairable and snapshot and not self._busy else "disabled"
         )
         for button, enabled in (
             (self.generate_button, actions.generate), (self.install_button, actions.install),
@@ -948,11 +981,37 @@ class W3DualSubtitleApp:
             self.snapshot = replace(self.snapshot, generation_record=record,
                                     generation_freshness=freshness)
         self._render_generation_and_install()
+        merge_summary = _merge_summary(record)
+        stats_text = f"; {merge_summary}" if merge_summary else ""
+        unmatched_text = (f"; {record.unmatched_entries_count:,} unmatched identities"
+                          if record.unmatched_entries_count is not None else "")
         self.status_var.set(
-            f"Preview ready: {len(record.output_files)} target files; source freshness {freshness.value}. "
-            "Review paths and hashes before Install or Modify."
+            f"Preview ready: {len(record.output_files)} target files{stats_text}{unmatched_text}; "
+            f"source freshness {freshness.value}. "
+            "Open the unmatched list for details; review paths and hashes before Install or Modify."
         )
         self._refresh_action_buttons()
+
+    def _unmatched_report_path(self) -> Path | None:
+        record = self.snapshot.generation_record if self.snapshot else None
+        if record is None:
+            return None
+        report = record.generation_dir / "unmatched_entries.csv"
+        return report if report.is_file() else None
+
+    def _open_unmatched_entries(self):
+        report = self._unmatched_report_path()
+        if report is None:
+            self.status_var.set("No unmatched entries report is available for this preview.")
+            return
+        open_file = getattr(os, "startfile", None)
+        if not callable(open_file):
+            self.status_var.set(f"Unmatched entries report: {report}")
+            return
+        try:
+            open_file(str(report))
+        except OSError as error:
+            messagebox.showerror("Cannot open unmatched list", f"{error}\n\n{report}")
 
     def _install(self):
         if not self.snapshot or not self.snapshot.generation_record:

@@ -87,6 +87,9 @@ class GenerationRecord:
     output_hashes: dict[str, str]
     codec_kind: str = "external"
     classifier_schema_version: int | None = None
+    total_entries: int | None = None
+    merged_entries: int | None = None
+    unmatched_entries_count: int | None = None
 
 
 @dataclass(frozen=True)
