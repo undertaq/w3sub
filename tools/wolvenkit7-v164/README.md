@@ -44,3 +44,14 @@ fail closed. The helper does not establish inventory coverage by itself. A full
 production index must prove all reference-bearing resource formats are included.
 Only numeric IDs/types/field names are emitted. Parsing diagnostics do not go to
 stdout. No conversion or installation is performed by the batch interface.
+
+Dependency disposition: the pinned `System.Text.Json` 7.0.1 is in the affected
+range of [GHSA-hh2w-p6rv-4g7w](https://github.com/advisories/GHSA-hh2w-p6rv-4g7w)
+(CVE-2024-30105), a denial of service involving
+`JsonSerializer.DeserializeAsyncEnumerable` on untrusted input. The added batch
+protocol parses its manifest with Newtonsoft `JObject.Parse`; the reviewed
+batch path did not establish reachability of the affected method. This is not
+a reachability proof. Complete an audited dependency update or a reachability
+proof before expanding helper exposure. Any dependency update must rebuild
+from the pinned source recipe, ship the matching corresponding source and
+notices, and update the reviewed dependency hashes and trusted helper manifest.

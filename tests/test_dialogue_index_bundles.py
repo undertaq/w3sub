@@ -24,6 +24,7 @@ class DialogueBundleIndexTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(module, 'state_root_for', return_value=self.state, create=True).start()
         patch.object(module, 'validate_wolvenkit_helper', return_value=self.helper, create=True).start()
+        patch('w3sub_app.wolvenkit_scene_refs.validate_wolvenkit_helper', return_value=self.helper).start()
         self.scan = patch.object(module, 'scan_localized_references', side_effect=self.references, create=True).start()
 
     def write_bundle(self, rows=None, path=None):
@@ -31,7 +32,7 @@ class DialogueBundleIndexTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(_bundle_bytes(rows or [('line.w2scene', b'CR2Wline', 1)]))
 
-    def references(self, manifest_path, helper_path, work_dir, progress_callback=None):
+    def references(self, manifest_path, helper_path, work_dir, progress_callback=None, *, session=None):
         result = []
         resources = json.loads(Path(manifest_path).read_text())['resources']
         for resource in resources:
@@ -165,10 +166,50 @@ class DialogueBundleIndexTests(unittest.TestCase):
             self.assertIsNotNone(module.load_dialogue_index(self.game))
             validate.assert_called_once_with(module.DEFAULT_HELPER_PATH, check_protocol=False)
 
+    def test_generation_load_checks_resource_freshness_only_once(self):
+        from w3sub_app import generation
+        self.write_bundle()
+        self.assertIsNotNone(module.build_dialogue_index(self.game))
+        reads = []
+        original_read = module.read_bundle_entry
+        def count_read(*arguments):
+            reads.append(arguments[1].depot_path)
+            return original_read(*arguments)
+        with patch.object(module, 'read_bundle_entry', side_effect=count_read):
+            index = generation._current_dialogue_index(self.game)
+        self.assertIsNotNone(index)
+        self.assertEqual(reads, ['line.w2scene'])
+        self.write_bundle([('line.w2scene', b'CR2Wchoice', 0)])
+        self.assertIsNone(generation._current_dialogue_index(self.game))
+
+    def test_build_reuses_validated_session_but_revalidates_before_publication(self):
+        self.write_bundle([('line.w2scene', b'CR2Wline', 0), ('item.w2ent', b'CR2Witem', 0)])
+        from w3sub_app import wolvenkit_scene_refs as refs
+        with patch.object(module, '_BATCH_SIZE', 1), \
+             patch.object(refs, 'validate_wolvenkit_helper', return_value=self.helper) as begin, \
+             patch.object(module, 'validate_wolvenkit_helper', return_value=self.helper) as finish:
+            index = module.build_dialogue_index(self.game)
+        self.assertIsNotNone(index)
+        begin.assert_called_once_with(module.DEFAULT_HELPER_PATH)
+        finish.assert_called_once_with(module.DEFAULT_HELPER_PATH, check_protocol=False)
+        self.assertEqual(index.context_for_id('100'), module.DialogContext.AMBIGUOUS)
+        sessions = [call.kwargs['session'] for call in self.scan.call_args_list]
+        self.assertEqual(len(sessions), 2)
+        self.assertIs(sessions[0], sessions[1])
+
+    def test_changed_helper_during_scan_cannot_publish_index(self):
+        self.write_bundle()
+        from w3sub_app import wolvenkit_scene_refs as refs
+        with patch.object(refs, 'validate_wolvenkit_helper', return_value=self.helper), \
+             patch.object(module, 'validate_wolvenkit_helper', return_value=replace(
+                 self.helper, executable_sha256='b' * 64)):
+            self.assertIsNone(module.build_dialogue_index(self.game))
+        self.assertFalse((self.state / 'dialogue-index.json').exists())
+
     def test_changed_game_during_scan_is_not_published(self):
         self.write_bundle()
-        def changed_game(*arguments):
-            references = self.references(*arguments)
+        def changed_game(*arguments, **keywords):
+            references = self.references(*arguments, **keywords)
             self.write_bundle([('choice.w2scene', b'CR2Wchoice', 0)])
             return references
         self.scan.side_effect = changed_game
@@ -197,7 +238,7 @@ class DialogueBundleIndexTests(unittest.TestCase):
 
     def test_malformed_typed_reference_is_rejected_at_builder_boundary(self):
         self.write_bundle()
-        self.scan.side_effect = lambda manifest, *args: (LocalizedReference(True, json.loads(manifest.read_text())['resources'][0]['resource_identity'], 'CStorySceneLine', 'dialogLine'),)
+        self.scan.side_effect = lambda manifest, *args, **kwargs: (LocalizedReference(True, json.loads(manifest.read_text())['resources'][0]['resource_identity'], 'CStorySceneLine', 'dialogLine'),)
         self.assertIsNone(module.build_dialogue_index(self.game))
 
     def test_empty_missing_or_unreadable_inventory_is_unavailable(self):

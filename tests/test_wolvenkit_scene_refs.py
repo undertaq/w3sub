@@ -108,6 +108,32 @@ class HelperIdentityTests(unittest.TestCase):
         self.assertTrue(identity.supports_v164)
         self.assertEqual(identity.upstream_commit, refs.UPSTREAM_COMMIT)
 
+    def test_session_hashes_distribution_once_across_multiple_batches(self):
+        manifest = self.root / 'resources.json'
+        manifest.write_text(json.dumps({'schema': 1, 'resources': [
+            {'resource_identity': 'line', 'path': str(self.root / 'scene.cr2w')}
+        ]}), encoding='utf-8')
+        batch = subprocess.CompletedProcess([], 0, json.dumps({
+            'schema': 1, 'resource_identity': 'line', 'ok': True, 'references': [
+                {'string_id': 100, 'owner_type': 'CStorySceneLine', 'field_name': 'dialogLine'}
+            ]}), '')
+        hashed = []
+        original_hash = refs._sha256
+        def count_hash(path):
+            hashed.append(path.name)
+            return original_hash(path)
+        with patch.object(refs, 'TRUSTED_MANIFEST_SHA256', self.manifest_hash), \
+             patch.object(refs, '_sha256', side_effect=count_hash), \
+             patch('subprocess.run', side_effect=[self.identity, batch, batch, batch]):
+            self.assertTrue(hasattr(refs, 'WolvenkitHelperSession'), 'a validated batch session is required')
+            session = refs.WolvenkitHelperSession(self.helper)
+            for _ in range(3):
+                result = refs.scan_localized_references(manifest, self.helper, self.root / 'work',
+                                                         session=session)
+                self.assertEqual([(r.string_id, r.field_name) for r in result], [(100, 'dialogLine')])
+        self.assertEqual(hashed.count('source.zip'), 1)
+        self.assertEqual(hashed.count('parser.dll'), 1)
+
     def test_rejects_modified_manifest_even_if_it_claims_new_hashes(self):
         import hashlib
         self.helper.write_bytes(b'replacement helper')

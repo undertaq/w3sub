@@ -201,19 +201,42 @@ def validate_wolvenkit_helper(helper_path: Path, *, check_protocol: bool = True)
                           files[f'bin/{helper_path.name}'], True)
 
 
+@dataclass(frozen=True, init=False)
+class WolvenkitHelperSession:
+    """One build's validated package identity, shared across its batches.
+
+    This is deliberately operation-scoped, never a persistent validation cache.
+    The index builder must validate the full package again before publication.
+    """
+
+    helper_path: Path
+    identity: HelperIdentity
+
+    def __init__(self, helper_path: Path):
+        path = Path(helper_path).resolve()
+        identity = validate_wolvenkit_helper(path)
+        object.__setattr__(self, 'helper_path', path)
+        object.__setattr__(self, 'identity', identity)
+
+
 def scan_localized_references(
         manifest_path: Path, helper_path: Path, work_dir: Path,
         progress_callback: Callable[[int, int], None] | None = None,
+        *, session: WolvenkitHelperSession | None = None,
 ) -> tuple[LocalizedReference, ...]:
     """Inspect a complete batch; never return successful results from a partial scan.
 
     Manifest: {schema: 1, resources: [{path: absolute path,
     resource_identity: stable physical entry identity}]}. Output records use
     schema 1, resource_identity, ok, references (string_id/owner_type/field_name).
-    No game text is written by this adapter.
+    No game text is written by this adapter. A build may reuse its validated
+    session; standalone scans still validate the complete package on entry.
     """
     manifest_path, helper_path, work_dir = map(Path, (manifest_path, helper_path, work_dir))
-    validate_wolvenkit_helper(helper_path)
+    if session is None:
+        validate_wolvenkit_helper(helper_path)
+    elif not isinstance(session, WolvenkitHelperSession) or session.helper_path != helper_path.resolve():
+        raise SceneReferenceError('Batch session belongs to a different helper')
     manifest = _read_json(manifest_path)
     if not isinstance(manifest, dict) or type(manifest.get('schema')) is not int or manifest.get('schema') != 1 or not isinstance(manifest.get('resources'), list):
         raise SceneReferenceError('Invalid resource manifest')

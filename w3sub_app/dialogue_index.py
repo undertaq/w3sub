@@ -23,7 +23,7 @@ from .config import state_root_for
 from .game import fingerprint_files
 from .models import GameInstallation, GameVersion, ResourceFingerprint
 from .wolvenkit_scene_refs import (
-    DEFAULT_HELPER_PATH, HelperIdentity, LocalizedReference,
+    DEFAULT_HELPER_PATH, HelperIdentity, LocalizedReference, WolvenkitHelperSession,
     scan_localized_references, validate_wolvenkit_helper,
 )
 
@@ -552,7 +552,8 @@ def build_dialogue_index(
         counts['audited_formats'] = list(_AUDITED_FORMATS)
         if loose:
             raise ValueError(f'{loose[0]}: unaudited loose resource format; bundle inventory alone is incomplete')
-        helper = validate_wolvenkit_helper(DEFAULT_HELPER_PATH)
+        session = WolvenkitHelperSession(DEFAULT_HELPER_PATH)
+        helper = session.identity
         hashes = {}
         contexts = {}
         state.mkdir(parents=True, exist_ok=True)
@@ -581,6 +582,7 @@ def build_dialogue_index(
                 references = scan_localized_references(
                     manifest, DEFAULT_HELPER_PATH, workspace,
                     (lambda done, total: progress_callback(start + done, len(entries))) if progress_callback else None,
+                    session=session,
                 )
                 for reference in references:
                     string_id, context = _reference_context(reference, expected)

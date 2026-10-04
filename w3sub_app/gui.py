@@ -673,8 +673,6 @@ class W3DualSubtitleApp:
         self.index_status_var.set("Dialogue index: " + (
             "Ready" if snapshot.dialogue_index_available else snapshot.dialogue_index_state.capitalize()))
         self.dialogue_mode.configure(state="normal" if snapshot.dialogue_index_available else "disabled")
-        if not snapshot.dialogue_index_available and self.mode_var.get() == MergeMode.DIALOGUE_ONLY.value:
-            self.mode_var.set(MergeMode.FULL_TEXT.value)
         self._render_generation_and_install()
         self._set_candidate_values()
         self._refresh_action_buttons()

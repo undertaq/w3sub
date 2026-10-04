@@ -290,6 +290,26 @@ class GuiHelperTests(unittest.TestCase):
                 app._dialogue_index_built(ready)
                 self.assertEqual((app.primary_var.get(), app.secondary_var.get()), expected[::-1])
 
+    def test_dialogue_selection_survives_stale_or_failed_refresh_until_explicit_full_text(self):
+        for state in ("stale", "unavailable"):
+            with self.subTest(state=state), patch("w3sub_app.gui.config.save_config"), \
+                 patch("w3sub_app.gui.detect_configured_text_language", return_value="zh"):
+                app = self.index_app(self.make_game("selected-dialogue-" + state))
+                ready = replace(app.snapshot, dialogue_index_available=True, dialogue_index_state="ready")
+                app._apply_snapshot(ready)
+                app.mode_var.set(MergeMode.DIALOGUE_ONLY.value)
+                app._mode_changed()
+                self.assertEqual(app.generate_button.options["state"], "normal")
+                failed = replace(ready, dialogue_index_available=False, dialogue_index_state=state,
+                                 dialogue_index_reason="resource changed; rebuild required")
+                app._dialogue_index_built(failed)
+                self.assertEqual(app.mode_var.get(), MergeMode.DIALOGUE_ONLY.value)
+                self.assertEqual(app.generate_button.options["state"], "disabled")
+                self.assertEqual(app.full_mode.options["state"], "normal")
+                app.mode_var.set(MergeMode.FULL_TEXT.value)
+                app._mode_changed()
+                self.assertEqual(app.generate_button.options["state"], "normal")
+
     def test_old_root_index_result_does_not_replace_selected_game(self):
         app = self.index_app(self.make_game("index-old"))
         old_result = app.snapshot

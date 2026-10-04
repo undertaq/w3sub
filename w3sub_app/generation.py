@@ -171,6 +171,8 @@ def _hash_executable(converter) -> tuple[Path, str]:
 
 
 def _current_dialogue_index(game: GameInstallation):
+    # load_dialogue_index already validates inventory, payloads and helper.
+    # Every caller still loads afresh at its publication/install boundary.
     index = load_dialogue_index(game)
     if (getattr(index, "validated", False) is not True
             or not callable(getattr(index, "is_current", None))
@@ -178,11 +180,6 @@ def _current_dialogue_index(game: GameInstallation):
             or not callable(getattr(index, "context_for_id", None))
             or type(getattr(index, "schema_version", None)) is not int
             or index.schema_version != INDEX_SCHEMA_VERSION):
-        return None
-    try:
-        if index.is_current(game) is not True:
-            return None
-    except Exception:
         return None
     digest = getattr(index, "digest", None)
     if not isinstance(digest, str) or not digest:

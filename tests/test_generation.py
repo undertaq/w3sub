@@ -110,7 +110,8 @@ class GenerationTests(unittest.TestCase):
         (self.game_root / "refs" / "scene.json").write_text("changed references", encoding="utf-8")
         for unavailable in (None, index):
             with self.subTest(index=unavailable):
-                with patch.object(generation, "load_dialogue_index", return_value=unavailable):
+                with patch.object(generation, "load_dialogue_index", side_effect=lambda game:
+                                  unavailable if unavailable is not None and unavailable.is_current(game) else None):
                     with self.assertRaisesRegex(GenerationError, "current validated dialogue index"):
                         generate(self.request(mode=MergeMode.DIALOGUE_ONLY), self.state_root)
         self.assertFalse(self.state_root.exists())
@@ -304,7 +305,8 @@ class GenerationTests(unittest.TestCase):
 
     def test_dialogue_index_that_expires_during_merge_cannot_publish_generation(self):
         index = ExpiringDialogueIndex()
-        with patch.object(generation, "load_dialogue_index", return_value=index):
+        with patch.object(generation, "load_dialogue_index", side_effect=lambda game:
+                          index if index.is_current(game) else None):
             with self.assertRaisesRegex(GenerationError, "index changed during generation"):
                 generate(self.request(mode=MergeMode.DIALOGUE_ONLY),
                          self.state_root, self.converter)
