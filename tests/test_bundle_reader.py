@@ -5,6 +5,7 @@ import zlib
 from pathlib import Path
 
 from w3sub_app.bundle_reader import (
+    BundleEntry,
     BundleReadError,
     enumerate_witcher_bundles,
     iter_bundle_entries,
@@ -127,6 +128,24 @@ class BundleReaderTests(unittest.TestCase):
             entry = next(iter_bundle_entries(path))
             with self.assertRaisesRegex(BundleReadError, "bad.bundle.*CRC"):
                 read_bundle_entry(path, entry)
+
+    def test_rejects_forged_entry_pointing_into_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "forged.bundle"
+            path.write_bytes(_bundle_bytes([("a", b"payload", 0)]))
+            forged = BundleEntry(
+                bundle_path=path,
+                entry_index=0,
+                depot_path="a",
+                offset=32,
+                compressed_size=1,
+                uncompressed_size=1,
+                crc32=zlib.crc32(b"a") & 0xFFFFFFFF,
+                compression_method=0,
+            )
+
+            with self.assertRaisesRegex(BundleReadError, "forged.bundle.*metadata"):
+                read_bundle_entry(path, forged)
 
 
 if __name__ == "__main__":

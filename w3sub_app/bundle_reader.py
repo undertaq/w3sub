@@ -131,7 +131,7 @@ def iter_bundle_entries(bundle_path: Path) -> Iterator[BundleEntry]:
 
 
 def read_bundle_entry(bundle_path: Path, entry: BundleEntry) -> bytes:
-    """Read and verify one physical entry without trusting its declared sizes."""
+    """Read and verify one entry against its current bundle metadata and payload."""
     path = Path(bundle_path)
     if Path(entry.bundle_path).resolve() != path.resolve():
         raise BundleReadError(path, "entry belongs to a different bundle")
@@ -139,10 +139,6 @@ def read_bundle_entry(bundle_path: Path, entry: BundleEntry) -> bytes:
         physical_size = path.stat().st_size
         if entry.offset < 0 or entry.compressed_size < 0 or entry.uncompressed_size < 0:
             raise BundleReadError(path, f"entry {entry.entry_index} has negative bounds or sizes")
-        if entry.offset < _HEADER_SIZE or entry.offset > physical_size:
-            raise BundleReadError(path, f"entry {entry.entry_index} payload is out of bounds")
-        if entry.compressed_size > physical_size - entry.offset:
-            raise BundleReadError(path, f"entry {entry.entry_index} payload is out of bounds")
         if entry.compression_method not in (0, 1):
             raise BundleReadError(
                 path,
@@ -153,6 +149,61 @@ def read_bundle_entry(bundle_path: Path, entry: BundleEntry) -> bytes:
         checksum = 0
         decoder = zlib.decompressobj() if entry.compression_method == 1 else None
         with path.open("rb") as stream:
+            header = _read_exact(stream, _HEADER_SIZE, path, "bundle header")
+            if header[:8] != _SIGNATURE:
+                raise BundleReadError(path, "invalid POTATO70 signature")
+            declared_size = struct.unpack_from("<Q", header, 8)[0]
+            metadata_size = struct.unpack_from("<I", header, 16)[0]
+            version = struct.unpack_from("<H", header, 20)[0]
+            if version != 5:
+                raise BundleReadError(path, f"unsupported POTATO70 header version {version}; expected v5")
+            if declared_size != physical_size:
+                raise BundleReadError(
+                    path,
+                    f"declared bundle size {declared_size} does not match file size {physical_size}",
+                )
+            if metadata_size % _ENTRY_SIZE:
+                raise BundleReadError(
+                    path,
+                    f"entry metadata size {metadata_size} is not divisible by {_ENTRY_SIZE}",
+                )
+            table_end = _HEADER_SIZE + metadata_size
+            entry_count = metadata_size // _ENTRY_SIZE
+            if table_end > physical_size:
+                raise BundleReadError(path, "truncated entry metadata table")
+            if entry.entry_index < 0 or entry.entry_index >= entry_count:
+                raise BundleReadError(path, f"entry index {entry.entry_index} is outside current metadata table")
+
+            stream.seek(_HEADER_SIZE + entry.entry_index * _ENTRY_SIZE)
+            raw = _read_exact(stream, _ENTRY_SIZE, path, f"entry metadata {entry.entry_index}")
+            name_bytes = raw[:256].split(b"\0", 1)[0]
+            current_depot_path = name_bytes.decode("utf-8", errors="surrogateescape")
+            current_offset, current_uncompressed_size, current_compressed_size, current_crc32, current_method = (
+                struct.unpack_from("<QIIIB", raw, 272)
+            )
+            current_entry = (
+                current_depot_path,
+                current_offset,
+                current_compressed_size,
+                current_uncompressed_size,
+                current_crc32,
+                current_method,
+            )
+            requested_entry = (
+                entry.depot_path,
+                entry.offset,
+                entry.compressed_size,
+                entry.uncompressed_size,
+                entry.crc32,
+                entry.compression_method,
+            )
+            if current_entry != requested_entry:
+                raise BundleReadError(path, f"entry {entry.entry_index} metadata is stale or does not match bundle")
+            if current_offset < table_end:
+                raise BundleReadError(path, f"entry {entry.entry_index} payload overlaps metadata")
+            if current_offset > physical_size or current_compressed_size > physical_size - current_offset:
+                raise BundleReadError(path, f"entry {entry.entry_index} payload is out of bounds")
+
             stream.seek(entry.offset)
             remaining_compressed = entry.compressed_size
             while remaining_compressed:
