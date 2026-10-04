@@ -112,12 +112,12 @@ if ($SourceArchive) {
     $archive = [IO.Compression.ZipFile]::Open($sourcePackage, [IO.Compression.ZipArchiveMode]::Update)
     try {
         # Overlay exactly the patched build sources; unchanged files remain the pinned archive.
-        foreach ($relative in @('WolvenKit.CR2W/CR2W/CR2WFile.cs', 'WolvenKit.CLI/Program.cs', 'WolvenKit.CLI/ReferenceBatch.cs')) {
+        foreach ($relative in @('WolvenKit.CR2W/JSON/CR2WJsonTool.cs', 'WolvenKit.CR2W/CR2W/CR2WFile.cs', 'WolvenKit.CLI/Program.cs', 'WolvenKit.CLI/ReferenceBatch.cs')) {
             $old = $archive.GetEntry('source/' + $relative)
             if ($old) { $old.Delete() }
             [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $source $relative), 'source/' + $relative, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
-        foreach ($relative in @('build.ps1', 'patches/wolvenkit7-v164-batch.patch', 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md')) {
+        foreach ($relative in @('build.ps1', 'patches/wolvenkit7-v164-batch.patch', 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'tests/OpaqueByteRegression.cs', 'tests/OpaqueByteRegression.csproj')) {
             [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $PSScriptRoot $relative), $relative, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
         foreach ($file in @(Get-Item -LiteralPath (Join-Path $OutputRoot 'dependencies.json')) + @(Get-ChildItem -LiteralPath $notices -Recurse -File)) {

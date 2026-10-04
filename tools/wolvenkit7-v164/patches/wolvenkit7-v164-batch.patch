@@ -17,10 +17,10 @@ index 9422883..6bac19c 100644
 +
 diff --git a/WolvenKit.CLI/ReferenceBatch.cs b/WolvenKit.CLI/ReferenceBatch.cs
 new file mode 100644
-index 0000000..7f2c7eb
+index 0000000..8e7eb4a
 --- /dev/null
 +++ b/WolvenKit.CLI/ReferenceBatch.cs
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,136 @@
 +// w3sub batch protocol. GPL-3.0; based on the pinned WolvenKit-7 source.
 +using System;
 +using System.Collections.Generic;
@@ -84,7 +84,7 @@ index 0000000..7f2c7eb
 +                        if (file == null) throw new FormatException("Unsupported or invalid CR2W resource");
 +                        if (file.UnknownTypes.Count != 0)
 +                            throw new FormatException("Unsupported CR2W types: " + string.Join(", ", file.UnknownTypes));
-+                        var document = JObject.FromObject(WalkCR2W(file, "", 0, new CR2WJsonToolOptions()));
++                        var document = JObject.FromObject(WalkCR2W(file, "", 0, CreateReferenceOptions()));
 +                        var references = new List<object>();
 +                        Visit(document, null, null, references);
 +                        result = new { schema = 1, resource_identity = identity, ok = true, references };
@@ -108,6 +108,9 @@ index 0000000..7f2c7eb
 +                return 2;
 +            }
 +        }
++
++        private static CR2WJsonToolOptions CreateReferenceOptions() =>
++            new CR2WJsonToolOptions { RejectUnparsedByteSources = true };
 +
 +        private static bool HasData(JToken token)
 +        {
@@ -178,3 +181,29 @@ index 3e43b68..f02670f 100644
                  return EFileReadErrorCodes.UnsupportedVersion;
  
              var dt = new CDateTime(m_fileheader.timeStamp, null, "");
+diff --git a/WolvenKit.CR2W/JSON/CR2WJsonTool.cs b/WolvenKit.CR2W/JSON/CR2WJsonTool.cs
+index 7620663..2a7c5f5 100644
+--- a/WolvenKit.CR2W/JSON/CR2WJsonTool.cs
++++ b/WolvenKit.CR2W/JSON/CR2WJsonTool.cs
+@@ -26,6 +26,8 @@ namespace WolvenKit.CR2W.JSON
+         public bool Verbose { get; set; } = false;
+         public bool BytesAsIntList { get; set; } = false;
+         public bool IgnoreEmbeddedCR2W { get; set; } = false;
++        // Opt-in for reference inventories; legacy exports retain their defaults.
++        public bool RejectUnparsedByteSources { get; set; } = false;
+     }
+ 
+     public class CR2WJsonTool
+@@ -729,6 +731,12 @@ namespace WolvenKit.CR2W.JSON
+                             return WalkCR2W(extraCR2W, $"{extension}{node.REDName}::", logLevel + 1, options);
+                         }
+                     }
++                    // A failed embedded parse leaves uninterpreted bytes. A
++                    // complete reference inventory cannot silently skip them.
++                    // This checks IByteSource, so fixed typed values such as
++                    // CGUID (16-byte identifiers) keep their normal semantics.
++                    if (options.RejectUnparsedByteSources && extraCR2WBytes != null && extraCR2WBytes.Length != 0)
++                        throw new FormatException("Unsupported opaque byte primitive: " + node.REDName + " (" + node.REDType + ")");
+                     var primitiveValue = primitive.GetValueObject();
+                     if (options.Verbose)
+                     {

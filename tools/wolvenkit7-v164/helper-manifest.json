@@ -53,17 +53,17 @@
     "bin/System.ValueTuple.dll": "e905d102585b22c6df04f219af5cbdbfa7bc165979e9788b62df6dcc165e10f4",
     "bin/tr/Microsoft.CodeAnalysis.CSharp.resources.dll": "b8281907bc5f3445b023f92247ecec487e7011a76777588780462086a98b653a",
     "bin/tr/Microsoft.CodeAnalysis.resources.dll": "2c8ed3d616e218b6efcda827b8f481bcc224f3201539e988c9c1f3ea82343ee8",
-    "bin/WolvenKit.CLI.exe": "95172cf28e079a81a8c063644a5ab7c44e42ed5a42b2979174825c4c7792b3d9",
+    "bin/WolvenKit.CLI.exe": "599bd85476a4b7f2afe9ae1780d6ee8c33a0b6bd3341f94da795a05725df44d2",
     "bin/WolvenKit.CLI.exe.config": "461e3b893250801c520edeb4caa7950c34857bfcc1e17bbd519a1072842d402d",
     "bin/WolvenKit.Common.dll": "9dc1735e296eda81a049ee9ff4718e52d059728bbd46f7bb45886fd14a376cad",
     "bin/WolvenKit.Common.dll.config": "a0b2363c91efed670fb588ad1d53b01b1d7187b7529dc4d1c47018aa83b38659",
-    "bin/WolvenKit.CR2W.dll": "3eceb8400e1c8b8bb19e36f0965462b8b7f125191b19754a241dc410b4f50593",
+    "bin/WolvenKit.CR2W.dll": "48d73dff4ca8a996cde81e7bc7ec14ee964e85e9311eb71442accc487506f929",
     "bin/WolvenKit.CR2W.dll.config": "f3790cfe7ca287576a412f0cfdc842e11d3e84144bdf88ed66986b558df94512",
     "bin/zh-Hans/Microsoft.CodeAnalysis.CSharp.resources.dll": "307708ac77c1e5e7a77937aa2e616cc53d8afa80d16132ff3acaa860108603c5",
     "bin/zh-Hans/Microsoft.CodeAnalysis.resources.dll": "2d5328c062dbde0431b8223ea8aa34101efa3464c5a926b2a167957e9d5fae5b",
     "bin/zh-Hant/Microsoft.CodeAnalysis.CSharp.resources.dll": "d873cfbe39338f331ab0164e7613a556cc70c2768cc1485b2a747e862a3c63dc",
     "bin/zh-Hant/Microsoft.CodeAnalysis.resources.dll": "0dffb32005988ef05900bea52eebedcb40541503963de23414682a6a6df61b07",
-    "wolvenkit7-v164-corresponding-source.zip.001": "dcc2442ae5f9e05c7cf6ecf01049fae4023612bbb83f70e0b3d7d97ed7b0dc18",
-    "wolvenkit7-v164-corresponding-source.zip.002": "bc8d166d9534c267734a5816a3db9786e13d427594b769943b75a2edde9dc90c"
+    "wolvenkit7-v164-corresponding-source.zip.001": "09196529d28931f7a16699b7def1d0eed174bb9e0dd58eab64de6cbb98ec177b",
+    "wolvenkit7-v164-corresponding-source.zip.002": "680bdae99b88fbc55752487946c344d25fb8d08b4b83510191e53fb2a7ecc15f"
   }
 }

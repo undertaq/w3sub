@@ -93,7 +93,7 @@ def load_scene_dialogue_references(
 
 # Separate-process WolvenKit batch protocol. Keep the scene-export API above for
 # existing callers and prototype diagnostics.
-TRUSTED_MANIFEST_SHA256 = 'd2c316e2da9381aaf3fef45f3ae881440d1d69c91106e3114f995011355053dd'
+TRUSTED_MANIFEST_SHA256 = '6e88972d3df0d674e1cafc806f59ac6bae68310dfb1b52fda936c37b46aa3dcb'
 HELPER_VERSION = 'w3sub-wolvenkit7-v164-1'
 UPSTREAM_COMMIT = '8eb4026349b1e419c189d42b8286b4a5613ab433'
 _HELPER_ROOT = Path(__file__).resolve().parent.parent / 'tools' / 'wolvenkit7-v164'
