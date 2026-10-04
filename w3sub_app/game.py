@@ -14,6 +14,93 @@ from .models import GameInstallation, GameVersion, ResourceFingerprint, Storefro
 VersionReader = Callable[[Path], str]
 
 
+def _documents_directories() -> tuple[Path, ...]:
+    """Return plausible Windows Documents folders, including redirected ones."""
+    candidates: list[Path] = []
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+                personal, _ = winreg.QueryValueEx(key, "Personal")
+            candidates.append(Path(os.path.expandvars(personal)).expanduser())
+        except (ImportError, OSError, TypeError, ValueError):
+            pass
+    for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root).expanduser() / "Documents")
+    candidates.append(Path.home() / "Documents")
+
+    unique = {}
+    for candidate in candidates:
+        try:
+            unique.setdefault(os.path.normcase(str(candidate.resolve())), candidate)
+        except OSError:
+            continue
+    return tuple(unique.values())
+
+
+def _witcher_user_settings_path() -> Path | None:
+    for documents in _documents_directories():
+        path = documents / "The Witcher 3" / "user.settings"
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def detect_configured_text_language(settings_path: Path | None = None) -> str | None:
+    """Read the active text language from the user's Witcher 3 settings file.
+
+    The game install contains resources for many languages, so its available
+    ``.w3strings`` files do not identify the user's selected language. Prefer
+    the effective ``TextLanguage`` setting and use ``RequestedTextLanguage``
+    only when the effective value is absent.
+    """
+    path = Path(settings_path) if settings_path is not None else _witcher_user_settings_path()
+    if path is None:
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+
+    text = None
+    for encoding in ("utf-8-sig", "utf-16"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeError:
+            continue
+    if text is None:
+        return None
+
+    localization: dict[str, str] = {}
+    section = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().casefold()
+            continue
+        if section != "localization" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().casefold()
+        if key in ("textlanguage", "requestedtextlanguage"):
+            localization[key] = value.strip().strip('"').strip("'")
+
+    for key in ("textlanguage", "requestedtextlanguage"):
+        value = localization.get(key, "").strip().casefold()
+        if re.fullmatch(r"[a-z]{2,4}", value):
+            return value
+    return None
+
+
 def read_executable_version(path: Path) -> str:
     """Read FileVersion (or ProductVersion) without truncating string components.
 
