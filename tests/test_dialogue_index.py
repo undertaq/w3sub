@@ -100,7 +100,7 @@ class DialogueIndexTests(unittest.TestCase):
         )
 
         self.assertTrue(scene.validated)
-        self.assertEqual(scene.schema_version, 1)
+        self.assertEqual(scene.schema_version, 2)
         self.assertEqual(scene.game_version, self.game.version)
         self.assertEqual(scene.source_fingerprint, fingerprint_files(self.root, [self.source]))
         self.assertNotEqual(scene.digest, overhead.digest)
@@ -151,7 +151,7 @@ class DialogueIndexTests(unittest.TestCase):
         self.assertIsNone(load_dialogue_index(self.game))
         self.assertIsNone(build_dialogue_index(self.game))
         reason = dialogue_index_unavailable_reason(self.game)
-        self.assertIn("packed bundle data", reason)
+        self.assertIn("no active packed bundle data", reason)
         self.assertIn("Full-text merge remains available", reason)
 
 

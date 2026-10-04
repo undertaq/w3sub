@@ -140,8 +140,13 @@ def _run_helper(arguments: list[str], *, timeout: int, cwd: Path | None = None):
         raise SceneReferenceError(f'WolvenKit helper unavailable: {error}') from error
 
 
-def validate_wolvenkit_helper(helper_path: Path) -> HelperIdentity:
-    """Check the pinned package (including DLLs/source), then its batch protocol."""
+def validate_wolvenkit_helper(helper_path: Path, *, check_protocol: bool = True) -> HelperIdentity:
+    """Check the pinned package; optionally probe the process's batch protocol.
+
+    Cache freshness only needs the pinned package hashes, so it can avoid
+    launching the already validated helper with ``check_protocol=False``.
+    Builds and reference scans retain the process probe.
+    """
     helper_path = Path(helper_path).resolve()
     metadata_path = helper_path.parent.parent / 'helper-manifest.json'
     try:
@@ -179,6 +184,9 @@ def validate_wolvenkit_helper(helper_path: Path) -> HelperIdentity:
     if (runtime_files != expected_runtime or not isinstance(source_packages, list)
             or not source_packages or any(name not in files for name in source_packages)):
         raise SceneReferenceError('Incomplete or modified helper distribution')
+    if not check_protocol:
+        return HelperIdentity(HELPER_VERSION, UPSTREAM_COMMIT,
+                              files[f'bin/{helper_path.name}'], True)
     result = _run_helper([str(helper_path), '--w3sub-identity'], timeout=30)
     try:
         identity = json.loads(result.stdout)
