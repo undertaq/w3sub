@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from w3sub_app import generation
-from w3sub_app.dialogue_index import DialogContext, DialogueIndex
+from w3sub_app.dialogue_index import INDEX_SCHEMA_VERSION, DialogContext, DialogueIndex
 from w3sub_app.generation import GenerationError, compare_generation, generate
 from w3sub_app.models import (
     Freshness,
@@ -46,6 +46,7 @@ class FakeConverter:
 
 class FakeDialogueIndex:
     validated = True
+    schema_version = INDEX_SCHEMA_VERSION
 
     def __init__(self, digest="classifier-a", current=True):
         self.digest = digest
@@ -55,6 +56,9 @@ class FakeDialogueIndex:
         return self.current
 
     def context_for(self, string_id, key):
+        return DialogContext.SCENE_SUBTITLE
+
+    def context_for_id(self, string_id):
         return DialogContext.SCENE_SUBTITLE
 
 
@@ -69,6 +73,76 @@ class ExpiringDialogueIndex(FakeDialogueIndex):
 
 
 class GenerationTests(unittest.TestCase):
+    def fixture_index(self):
+        source = self.game_root / "refs" / "scene.json"
+        source.parent.mkdir(parents=True)
+        source.write_text("controlled reference inventory", encoding="utf-8")
+        return DialogueIndex.from_validated_references(
+            self.game, [source], {("1", "0"): [DialogContext.SCENE_SUBTITLE]},
+            source_roots=[source.parent], source_patterns=["scene*.json"])
+
+    def test_native_keyless_dialogue_generation_records_index_schema_and_digest(self):
+        from w3sub_app.w3strings_native import StringsFile, decode, encode
+        for language in ("en", "zh"):
+            for path in self.game.language_files[language]:
+                path.write_bytes(encode(StringsFile(164, 0, ((1, language),), ())))
+        index = self.fixture_index()
+        with patch.object(generation, "load_dialogue_index", return_value=index):
+            record = generate(self.request(mode=MergeMode.DIALOGUE_ONLY), self.state_root)
+            self.assertEqual(compare_generation(record, self.game), Freshness.CURRENT)
+            self.assertEqual(compare_generation(replace(record, classifier_schema_version=1), self.game),
+                             Freshness.STALE)
+        output = Path(record.output_files["content/content0/en.w3strings"])
+        self.assertEqual(decode(output.read_bytes()).strings, ((1, "en<br>zh"),))
+        self.assertEqual(decode(output.read_bytes()).keys, ())
+        self.assertEqual(record.classifier_schema_version, index.schema_version)
+        self.assertEqual(record.classifier_digest, index.digest)
+        metadata = json.loads((record.generation_dir / "generation.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["classifier_schema_version"], index.schema_version)
+        self.assertEqual(metadata["classifier_digest"], index.digest)
+
+    def test_native_dialogue_generation_rejects_unavailable_or_stale_index(self):
+        from w3sub_app.w3strings_native import StringsFile, encode
+        for language in ("en", "zh"):
+            for path in self.game.language_files[language]:
+                path.write_bytes(encode(StringsFile(164, 0, ((1, language),), ())))
+        index = self.fixture_index()
+        (self.game_root / "refs" / "scene.json").write_text("changed references", encoding="utf-8")
+        for unavailable in (None, index):
+            with self.subTest(index=unavailable):
+                with patch.object(generation, "load_dialogue_index", return_value=unavailable):
+                    with self.assertRaisesRegex(GenerationError, "current validated dialogue index"):
+                        generate(self.request(mode=MergeMode.DIALOGUE_ONLY), self.state_root)
+        self.assertFalse(self.state_root.exists())
+
+    def test_changed_index_digest_during_generation_cannot_publish_record(self):
+        first = self.fixture_index()
+        second = DialogueIndex.from_validated_references(
+            self.game, [self.game_root / "refs" / "scene.json"],
+            {("1", "0"): [DialogContext.SCENE_SUBTITLE], ("2", "0"): [DialogContext.ITEM]},
+            source_roots=[self.game_root / "refs"], source_patterns=["scene*.json"])
+        self.assertNotEqual(first.digest, second.digest)
+        with patch.object(generation, "load_dialogue_index", side_effect=[first, second]):
+            with self.assertRaisesRegex(GenerationError, "index changed during generation"):
+                generate(self.request(mode=MergeMode.DIALOGUE_ONLY), self.state_root, self.converter)
+        self.assertEqual(list(self.state_root.rglob("generation.json")), [])
+        self.assertIsNone(generation.load_latest_generation_record(self.state_root, self.game.root))
+
+    def test_changed_index_schema_during_generation_cannot_publish_record(self):
+        index = FakeDialogueIndex()
+
+        class SchemaChangingConverter(FakeConverter):
+            def encode(self, csv_path, work_dir):
+                output = super().encode(csv_path, work_dir)
+                index.schema_version = 1
+                return output
+
+        with patch.object(generation, "load_dialogue_index", return_value=index):
+            with self.assertRaisesRegex(GenerationError, "index changed during generation"):
+                generate(self.request(mode=MergeMode.DIALOGUE_ONLY), self.state_root,
+                         SchemaChangingConverter(self.executable))
+        self.assertEqual(list(self.state_root.rglob("generation.json")), [])
+
     def test_default_native_generation_preserves_newlines_and_codec_identity(self):
         from w3sub_app.w3strings_native import StringsFile, decode, encode
         for language in ("en", "zh"):

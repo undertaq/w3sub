@@ -12,7 +12,7 @@ from .w3strings_native import StringsFile
 
 def merge_records(primary: StringsFile, secondary: StringsFile, mode: MergeMode,
                   dialogue_index=None, current_game=None) -> StringsFile:
-    """Merge by ID and a real shared hash; retain all primary key references."""
+    """Join shared keys, or validated keyless dialogue IDs; retain primary keys."""
     if not isinstance(mode, MergeMode):
         raise MergeError(f"Unsupported merge mode: {mode}")
     primary_keys = {}
@@ -32,16 +32,21 @@ def merge_records(primary: StringsFile, secondary: StringsFile, mode: MergeMode,
     strings = []
     for string_id, text in primary.strings:
         keys = primary_keys.get(string_id, set())
-        shared = keys & secondary_keys.get(string_id, set())
+        other_keys = secondary_keys.get(string_id, set())
+        shared = keys & other_keys
         combine = bool(shared) and string_id in other_texts
-        if combine and mode is MergeMode.DIALOGUE_ONLY:
+        if mode is MergeMode.DIALOGUE_ONLY:
+            # Only native files expose every association, including zero hashes.
+            keyless = not keys and not other_keys
+            combine = current and string_id in other_texts and (bool(shared) or keyless)
             # One string can serve several contexts; every primary association
             # must be verified as a subtitle before changing its shared text.
-            combine = current
             if combine:
                 try:
-                    combine = all(dialogue_index.context_for(str(string_id), format(key, "x"))
-                                  is DialogContext.SCENE_SUBTITLE for key in keys)
+                    combine = (dialogue_index.context_for_id(str(string_id))
+                               is DialogContext.SCENE_SUBTITLE
+                               and all(dialogue_index.context_for(str(string_id), format(key, "x"))
+                                       is DialogContext.SCENE_SUBTITLE for key in keys))
                 except Exception:
                     combine = False
         strings.append((string_id, text + "<br>" + other_texts[string_id] if combine else text))
@@ -61,6 +66,9 @@ class DialogueIndex(Protocol):
         ...
 
     def context_for(self, string_id: str, key: str) -> DialogContext:
+        ...
+
+    def context_for_id(self, string_id: str) -> DialogContext:
         ...
 
 

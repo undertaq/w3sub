@@ -174,7 +174,10 @@ def _current_dialogue_index(game: GameInstallation):
     index = load_dialogue_index(game)
     if (getattr(index, "validated", False) is not True
             or not callable(getattr(index, "is_current", None))
-            or not callable(getattr(index, "context_for", None))):
+            or not callable(getattr(index, "context_for", None))
+            or not callable(getattr(index, "context_for_id", None))
+            or type(getattr(index, "schema_version", None)) is not int
+            or index.schema_version != INDEX_SCHEMA_VERSION):
         return None
     try:
         if index.is_current(game) is not True:
@@ -249,6 +252,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
 
     dialogue_index = None
     classifier_digest = None
+    classifier_schema = None
     if request.mode is MergeMode.DIALOGUE_ONLY:
         dialogue_index = _current_dialogue_index(request.game)
         if dialogue_index is None:
@@ -256,6 +260,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
                 "Dialogue-only generation requires a current validated dialogue index"
             )
         classifier_digest = dialogue_index.digest
+        classifier_schema = dialogue_index.schema_version
 
     converter_path, converter_digest = _hash_executable(converter)
     converter_version = getattr(converter, "version", None)
@@ -324,7 +329,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
             raise GenerationError("A language resource changed during generation; retry")
         if request.mode is MergeMode.DIALOGUE_ONLY:
             current_index = _current_dialogue_index(request.game)
-            if current_index is None or current_index.digest != classifier_digest:
+            if (current_index is None or current_index.digest != classifier_digest
+                    or current_index.schema_version != classifier_schema):
                 raise GenerationError(
                     "The dialogue index changed during generation; retry with a current index"
                 )
@@ -350,8 +356,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
             output_files=output_files,
             output_hashes=output_hashes,
             codec_kind="native" if native else "external",
-            classifier_schema_version=(getattr(dialogue_index, "schema_version", INDEX_SCHEMA_VERSION)
-                                       if dialogue_index is not None else None),
+            classifier_schema_version=classifier_schema,
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -600,7 +605,8 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
             index = _current_dialogue_index(game)
         except OSError:
             return Freshness.UNREADABLE
-        if index is None or index.digest != record.classifier_digest:
+        if (index is None or index.digest != record.classifier_digest
+                or index.schema_version != record.classifier_schema_version):
             return Freshness.STALE
     elif record.classifier_digest is not None:
         return Freshness.STALE
