@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>DotNetHelper.FastMember.Extension</id>
+    <version>2.0.0</version>
+    <authors>DotNetHelper.FastMember.Extension</authors>
+    <owners>DotNetHelper.FastMember.Extension</owners>
+    <requireLicenseAcceptance>true</requireLicenseAcceptance>
+    <license type="file">LICENSE.md</license>
+    <licenseUrl>https://aka.ms/deprecateLicenseUrl</licenseUrl>
+    <projectUrl>https://github.com/TheMofaDe/DotNetHelper.FastMember.Extension</projectUrl>
+    <description>An object instance creator &amp; object mapper that uses Fast Member for reflection purposes. Also extends fast member feature to retrieve custom attributes from Members</description>
+    <releaseNotes>https://github.com/TheMofaDe/DotNetHelper.FastMember.Extension/blob/master/CHANGELOG.md</releaseNotes>
+    <tags>FastMember,Extensions,Reflection,Object Mapper,Instance Creator</tags>
+    <repository type="git" url="https://github.com/TheMofaDe/DotNetHelper.FastMember.Extension" />
+    <dependencies>
+      <group targetFramework=".NETFramework4.5">
+        <dependency id="FastMember" version="1.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.ValueTuple" version="4.5.0" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework=".NETFramework4.5.2">
+        <dependency id="FastMember" version="1.3.0" exclude="Build,Analyzers" />
+        <dependency id="System.ValueTuple" version="4.5.0" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework=".NETStandard2.0">
+        <dependency id="FastMember" version="1.3.0" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>

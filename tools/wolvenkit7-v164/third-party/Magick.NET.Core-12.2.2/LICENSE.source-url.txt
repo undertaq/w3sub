@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/dlemstra/Magick.NET/12.2.2/License.txt

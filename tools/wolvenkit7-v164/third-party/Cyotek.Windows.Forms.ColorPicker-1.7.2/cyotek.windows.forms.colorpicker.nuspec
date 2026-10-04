@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd">
+  <metadata>
+    <id>Cyotek.Windows.Forms.ColorPicker</id>
+    <version>1.7.2</version>
+    <title>Cyotek Color Picker Controls</title>
+    <authors>Cyotek</authors>
+    <owners>Cyotek</owners>
+    <licenseUrl>https://raw.githubusercontent.com/cyotek/Cyotek.Windows.Forms.ColorPicker/master/license.txt</licenseUrl>
+    <projectUrl>http://www.cyotek.com/blog/tag/colorpicker</projectUrl>
+    <iconUrl>http://static.cyotek.com/files/packageicons/colorpicker-32x32.png</iconUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Windows forms controls for selecting colors via various user interfaces.</description>
+    <summary>Windows forms controls for selecting colors via various user interfaces.</summary>
+    <releaseNotes />
+    <copyright>Copyright © 2013-2017 Cyotek Ltd.</copyright>
+    <language>en-GB</language>
+    <tags>colorpicker winforms cyotek</tags>
+    <dependencies />
+    <frameworkAssemblies>
+      <frameworkAssembly assemblyName="System.Windows.Forms" targetFramework="" />
+      <frameworkAssembly assemblyName="System.Drawing" targetFramework="" />
+    </frameworkAssemblies>
+  </metadata>
+</package>

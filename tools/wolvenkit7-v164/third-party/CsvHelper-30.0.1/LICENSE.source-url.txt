@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/JoshClose/CsvHelper/30.0.1/LICENSE.txt

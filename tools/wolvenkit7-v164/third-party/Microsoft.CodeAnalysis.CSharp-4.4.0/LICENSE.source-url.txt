@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/dotnet/roslyn/main/License.txt

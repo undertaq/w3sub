@@ -1,0 +1,180 @@
+diff --git a/WolvenKit.CLI/Program.cs b/WolvenKit.CLI/Program.cs
+index 9422883..6bac19c 100644
+--- a/WolvenKit.CLI/Program.cs
++++ b/WolvenKit.CLI/Program.cs
+@@ -46,6 +46,7 @@ namespace WolvenKit.CLI
+         public static void PrintOK(string text) => PrintColor(ConsoleColor.Green, text);
+         static void Main(string[] args)
+         {
++            if (args.Length > 0 && args[0].StartsWith("--w3sub-")) { Environment.Exit(ReferenceBatch.Run(args)); return; }
+             Debug.WriteLine($"args = {string.Join(";", args)}");
+             CommandLine.Parser.Default.ParseArguments<Options>(args)
+                                     .WithParsed(RunCLIOptions)
+@@ -120,3 +121,4 @@ namespace WolvenKit.CLI
+         }
+     }
+ }
++
+diff --git a/WolvenKit.CLI/ReferenceBatch.cs b/WolvenKit.CLI/ReferenceBatch.cs
+new file mode 100644
+index 0000000..7f2c7eb
+--- /dev/null
++++ b/WolvenKit.CLI/ReferenceBatch.cs
+@@ -0,0 +1,133 @@
++// w3sub batch protocol. GPL-3.0; based on the pinned WolvenKit-7 source.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++using WolvenKit.CR2W;
++using WolvenKit.CR2W.JSON;
++
++namespace WolvenKit.CLI
++{
++    internal class ReferenceBatch : CR2WJsonTool
++    {
++        internal const string Version = "w3sub-wolvenkit7-v164-1";
++        internal const string Commit = "8eb4026349b1e419c189d42b8286b4a5613ab433";
++
++        internal static int Run(string[] args)
++        {
++            Console.OutputEncoding = new UTF8Encoding(false);
++            if (args.Length == 1 && args[0] == "--w3sub-identity")
++            {
++                Console.WriteLine(JsonConvert.SerializeObject(new {
++                    schema = 1, version = Version, upstream_commit = Commit, supports_v164 = true }));
++                return 0;
++            }
++            if (args.Length != 2 || args[0] != "--w3sub-batch")
++            {
++                Console.Error.WriteLine("Expected --w3sub-batch MANIFEST or --w3sub-identity");
++                return 2;
++            }
++            try
++            {
++                var manifest = JObject.Parse(File.ReadAllText(args[1]));
++                if ((int?)manifest["schema"] != 1 || !(manifest["resources"] is JArray resources))
++                    throw new FormatException("Invalid resource manifest");
++                var ids = new HashSet<string>();
++                foreach (JToken resource in resources)
++                {
++                    if (!(resource is JObject obj) || obj.Count != 2 ||
++                        obj["resource_identity"]?.Type != JTokenType.String ||
++                        obj["path"]?.Type != JTokenType.String ||
++                        string.IsNullOrWhiteSpace((string)obj["resource_identity"]) ||
++                        !Path.IsPathRooted((string)obj["path"]) ||
++                        !ids.Add((string)obj["resource_identity"]))
++                        throw new FormatException("Malformed or duplicate manifest resource");
++                }
++                int failures = 0;
++                foreach (JObject resource in resources)
++                {
++                    string identity = (string)resource["resource_identity"];
++                    var protocolOutput = Console.Out;
++                    var diagnostics = new StringWriter();
++                    object result;
++                    try
++                    {
++                        // WolvenKit logs during parsing. Keep stdout exclusively JSONL.
++                        Console.SetOut(diagnostics);
++                        var file = ReadCR2W((string)resource["path"]);
++                        if (file == null) throw new FormatException("Unsupported or invalid CR2W resource");
++                        if (file.UnknownTypes.Count != 0)
++                            throw new FormatException("Unsupported CR2W types: " + string.Join(", ", file.UnknownTypes));
++                        var document = JObject.FromObject(WalkCR2W(file, "", 0, new CR2WJsonToolOptions()));
++                        var references = new List<object>();
++                        Visit(document, null, null, references);
++                        result = new { schema = 1, resource_identity = identity, ok = true, references };
++                    }
++                    catch (Exception error)
++                    {
++                        failures++;
++                        // Do not emit serialized game values or all parser logs.
++                        result = new { schema = 1, resource_identity = identity, ok = false,
++                            error = error.GetType().Name + ": " + error.Message };
++                    }
++                    finally { Console.SetOut(protocolOutput); }
++                    Console.WriteLine(JsonConvert.SerializeObject(result));
++                    Console.Out.Flush();
++                }
++                return failures == 0 ? 0 : 1;
++            }
++            catch (Exception error)
++            {
++                Console.Error.WriteLine(error.GetType().Name + ": " + error.Message);
++                return 2;
++            }
++        }
++
++        private static bool HasData(JToken token)
++        {
++            if (token == null || token.Type == JTokenType.Null) return false;
++            if (token is JArray a) return a.Count != 0;
++            if (token.Type == JTokenType.String) return ((string)token).Length != 0;
++            return token.HasValues;
++        }
++
++        private static void Visit(JToken node, string owner, string field, List<object> references)
++        {
++            if (node is JObject obj)
++            {
++                foreach (string opaque in new[] { "_unknownBytes", "_additionalBytes", "_embedded", "_buffers" })
++                    if (HasData(obj[opaque]))
++                        throw new FormatException("Unsupported opaque resource data: " + opaque);
++                string type = (string)obj["_type"];
++                if (type == "LocalizedString")
++                {
++                    JToken value = obj["_value"];
++                    uint id;
++                    if (value == null || (value.Type != JTokenType.Integer && value.Type != JTokenType.String) ||
++                        !uint.TryParse(value.ToString(), System.Globalization.NumberStyles.None,
++                            System.Globalization.CultureInfo.InvariantCulture, out id) ||
++                        string.IsNullOrEmpty(owner) || string.IsNullOrEmpty(field))
++                        throw new FormatException("Malformed typed LocalizedString reference");
++                    references.Add(new { string_id = id, owner_type = owner, field_name = field });
++                    return;
++                }
++                if (obj["_vars"] is JObject variables)
++                {
++                    if (string.IsNullOrWhiteSpace(type)) throw new FormatException("Missing structured owner type");
++                    foreach (JProperty variable in variables.Properties())
++                        Visit(variable.Value, type, variable.Name, references);
++                }
++                foreach (JProperty property in obj.Properties())
++                {
++                    if (property.Name == "_vars") continue;
++                    Visit(property.Value, owner, field, references);
++                }
++            }
++            else if (node is JArray array)
++                foreach (JToken element in array) Visit(element, owner, field, references);
++        }
++    }
++}
+diff --git a/WolvenKit.CR2W/CR2W/CR2WFile.cs b/WolvenKit.CR2W/CR2W/CR2WFile.cs
+index 3e43b68..f02670f 100644
+--- a/WolvenKit.CR2W/CR2W/CR2WFile.cs
++++ b/WolvenKit.CR2W/CR2W/CR2WFile.cs
+@@ -448,8 +448,8 @@ namespace WolvenKit.CR2W
+                 throw new FormatException($"Not a CR2W file, Magic read as 0x{id:X8}");
+ 
+             m_fileheader = file.BaseStream.ReadStruct<CR2WFileHeader>();
+-            if (m_fileheader.version > 163 || m_fileheader.version < 159)
+-                throw new FormatException($"Unknown Version {m_fileheader.version}. Supported versions: 159 - 163.");
++            if (m_fileheader.version > 164 || m_fileheader.version < 159)
++                throw new FormatException($"Unknown Version {m_fileheader.version}. Supported versions: 159 - 164.");
+ 
+             var dt = new CDateTime(m_fileheader.timeStamp, null, "");
+ 
+@@ -504,7 +504,7 @@ namespace WolvenKit.CR2W
+                 return EFileReadErrorCodes.NoCr2w;
+ 
+             m_fileheader = file.BaseStream.ReadStruct<CR2WFileHeader>();
+-            if (m_fileheader.version > 163 || m_fileheader.version < 159)
++            if (m_fileheader.version > 164 || m_fileheader.version < 159)
+                 return EFileReadErrorCodes.UnsupportedVersion;
+ 
+             var dt = new CDateTime(m_fileheader.timeStamp, null, "");

@@ -1,0 +1,7 @@
+# Preserve the byte identity of the approved package across Git checkouts.
+/bin/** -text whitespace=cr-at-eol,-trailing-space,-blank-at-eof
+/helper-manifest.json -text whitespace=cr-at-eol
+# Upstream source/notice formatting is preserved verbatim.
+/patches/*.patch -text whitespace=cr-at-eol,-trailing-space,-blank-at-eof
+/third-party/** -text whitespace=cr-at-eol,-trailing-space,-blank-at-eof
+/wolvenkit7-v164-corresponding-source.zip.* -text
