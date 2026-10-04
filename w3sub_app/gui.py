@@ -1,5 +1,6 @@
 """Tkinter desktop flow for the Witcher 3 dual-subtitle manager."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import json
 import logging
 import os
 from pathlib import Path
@@ -13,8 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 from . import config, generation, install, storefronts
 from .converter import CompatibilityReport, W3StringsConverter, check_compatibility
 from .w3strings_native import NativeW3StringsCodec
-from .dialogue_index import dialogue_index_unavailable_reason
-from .game import scan_game
+from .dialogue_index import build_dialogue_index, dialogue_index_unavailable_reason
+from .game import detect_configured_text_language, scan_game
 from .models import (
     AppConfig, Freshness, GameCandidate, GameInstallation, GenerationRecord,
     GenerationRequest, InstallComparison, InstallManifest, MergeMode, Storefront,
@@ -56,6 +57,8 @@ class GameSnapshot:
     generation_record: GenerationRecord | None
     generation_freshness: Freshness | None
     dialogue_index_available: bool
+    dialogue_index_state: str = "missing"
+    dialogue_index_reason: str = ""
 
 
 def _path_identity(path: Path) -> str:
@@ -117,15 +120,18 @@ def available_languages(game: GameInstallation) -> tuple[str, ...]:
 
 
 def default_language_pair(languages: tuple[str, ...], primary: str = "",
-                          secondary: str = "") -> tuple[str, str]:
+                          secondary: str = "", *,
+                          detected_primary_language: str = "") -> tuple[str, str]:
     choices = tuple(language.casefold() for language in languages)
     if primary.casefold() not in choices:
-        primary = "en" if "en" in choices else (choices[0] if choices else "")
+        detected = detected_primary_language.casefold()
+        primary = (detected if detected in choices else
+                   "en" if "en" in choices else (choices[0] if choices else ""))
     else:
         primary = primary.casefold()
     if secondary.casefold() not in choices or secondary.casefold() == primary:
-        secondary = next((code for code in ("zh", "cn", "pl", "fr", "de")
-                          if code in choices and code != primary), "")
+        preferred = "zh" if primary == "en" else "en"
+        secondary = preferred if preferred in choices and preferred != primary else ""
         if not secondary:
             secondary = next((code for code in choices if code != primary), "")
     else:
@@ -409,15 +415,22 @@ class W3DualSubtitleApp:
             mode, text="Full-text merge", variable=self.mode_var,
             value=MergeMode.FULL_TEXT.value, command=self._mode_changed,
         )
-        self.full_mode.pack(side="left")
+        self.full_mode.grid(row=0, column=0, sticky="w")
         self.dialogue_mode = ttk.Radiobutton(
             mode, text="Dialogue-only merge", variable=self.mode_var,
             value=MergeMode.DIALOGUE_ONLY.value, command=self._mode_changed,
         )
-        self.dialogue_mode.pack(side="left", padx=12)
+        self.dialogue_mode.grid(row=0, column=1, sticky="w", padx=12)
+        self.index_build_button = ttk.Button(
+            mode, text="Build/Refresh Dialogue Index", command=self._build_dialogue_index,
+        )
+        self.index_build_button.grid(row=0, column=2, sticky="w")
+        self.index_status_var = tk.StringVar(value="Dialogue index: missing")
+        ttk.Label(mode, textvariable=self.index_status_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
         self.mode_reason_var = tk.StringVar()
-        ttk.Label(mode, textvariable=self.mode_reason_var, wraplength=450).pack(
-            side="left", fill="x", expand=True)
+        ttk.Label(mode, textvariable=self.mode_reason_var, wraplength=780).grid(
+            row=2, column=0, columnspan=3, sticky="ew")
 
         actions = ttk.Frame(frame)
         actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(5, 7))
@@ -478,12 +491,18 @@ class W3DualSubtitleApp:
         self._set_controls_enabled(False)
         self._refresh_action_buttons()
 
-        start_background_operation(self._messages, label, operation, on_success, self.logger)
+        return start_background_operation(self._messages, label, operation, on_success, self.logger)
 
     def _poll_messages(self):
         try:
             while True:
                 label, payload, error = self._messages.get_nowait()
+                if label == "dialogue index progress":
+                    root, done, total = payload
+                    if (self._busy and self.snapshot and
+                            _path_identity(self.snapshot.selected.game.root) == root):
+                        self.index_status_var.set(f"Dialogue index: Building ({done:,}/{total:,})")
+                    continue
                 self._busy = False
                 if error is not None:
                     details = [str(error)]
@@ -516,7 +535,7 @@ class W3DualSubtitleApp:
         state = "normal" if enabled else "disabled"
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
                        self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
-                       self.full_mode, self.dialogue_mode, self.rescan_button):
+                       self.full_mode, self.dialogue_mode, self.rescan_button, self.index_build_button):
             try:
                 widget.configure(state=state)
             except tk.TclError:
@@ -576,8 +595,55 @@ class W3DualSubtitleApp:
             except Exception:
                 freshness = Freshness.STALE
         dialogue_index = generation._current_dialogue_index(game)
+        reason = "" if dialogue_index is not None else dialogue_index_unavailable_reason(game)
+        index_state = "ready" if dialogue_index is not None else "missing"
+        if dialogue_index is None:
+            try:
+                status = json.loads((state_root / "dialogue-index-status.json").read_text(encoding="utf-8"))
+                if status.get("state") in ("stale", "unavailable"):
+                    index_state = status["state"]
+            except (OSError, ValueError, AttributeError, UnicodeError):
+                pass
         return GameSnapshot(selected, manifest, comparison, record, freshness,
-                            dialogue_index is not None)
+                            dialogue_index is not None, index_state, reason)
+
+    def _build_dialogue_index(self):
+        if self._busy or self.snapshot is None:
+            return
+        original = self.snapshot
+        selected = original.selected
+        root_identity = _path_identity(selected.game.root)
+        self.snapshot = replace(original, dialogue_index_available=False,
+                                dialogue_index_state="building")
+        self.index_status_var.set("Dialogue index: Building — inventory scan…")
+        self.mode_reason_var.set("Scanning active resources; this first build can take time.")
+
+        def progress(done, total):
+            self._messages.put(("dialogue index progress", (root_identity, done, total), None))
+
+        def operation():
+            try:
+                candidate = storefronts.refresh_candidate(selected.candidate)
+                game = scan_selected_folder(candidate.root, candidate=candidate)
+                build_dialogue_index(game, progress_callback=progress)
+                # Cache validation (including hashing) stays on this worker.
+                return self._load_game_snapshot(ScannedGame(candidate, game))
+            except Exception as error:
+                logger = self.logger or logging.getLogger(config._LOGGER_NAME)
+                logger.exception("Dialogue index build failed")
+                return replace(original, dialogue_index_available=False,
+                               dialogue_index_state="unavailable",
+                               dialogue_index_reason=f"{error}. Full-text merge remains available.")
+
+        return self._submit("build dialogue index", operation, self._dialogue_index_built)
+
+    def _dialogue_index_built(self, snapshot: GameSnapshot):
+        if (self.snapshot is None or _path_identity(self.snapshot.selected.game.root) !=
+                _path_identity(snapshot.selected.game.root)):
+            return
+        self._apply_snapshot(snapshot)
+        self.status_var.set("Dialogue index ready" if snapshot.dialogue_index_available else
+                            snapshot.dialogue_index_reason)
 
     def _apply_snapshot(self, snapshot: GameSnapshot):
         self.snapshot = snapshot
@@ -597,12 +663,15 @@ class W3DualSubtitleApp:
         self.secondary_combo.configure(values=languages)
         primary, secondary = default_language_pair(
             languages, self.primary_var.get(), self.secondary_var.get(),
+            detected_primary_language=detect_configured_text_language() or "",
         )
         self.primary_var.set(primary)
         self.secondary_var.set(secondary)
         self.mode_reason_var.set(
-            "" if snapshot.dialogue_index_available else dialogue_index_unavailable_reason(game)
+            "" if snapshot.dialogue_index_available else snapshot.dialogue_index_reason
         )
+        self.index_status_var.set("Dialogue index: " + (
+            "Ready" if snapshot.dialogue_index_available else snapshot.dialogue_index_state.capitalize()))
         self.dialogue_mode.configure(state="normal" if snapshot.dialogue_index_available else "disabled")
         if not snapshot.dialogue_index_available and self.mode_var.get() == MergeMode.DIALOGUE_ONLY.value:
             self.mode_var.set(MergeMode.FULL_TEXT.value)
@@ -718,6 +787,13 @@ class W3DualSubtitleApp:
     def _pair_changed(self, _event=None):
         if self._busy:
             return
+        if (self.snapshot is not None
+                and getattr(_event, "widget", None) == self.primary_combo):
+            languages = available_languages(self.snapshot.selected.game)
+            _, secondary = default_language_pair(
+                languages, self.primary_var.get(), self.secondary_var.get(),
+            )
+            self.secondary_var.set(secondary)
         self.converter_compatible = False
         self._refresh_action_buttons()
         self._run_compatibility_check()
@@ -798,6 +874,7 @@ class W3DualSubtitleApp:
             dialogue_index_current=bool(snapshot and snapshot.dialogue_index_available),
         )
         pairable = self._resources_pairable()
+        self.index_build_button.configure(state="normal" if snapshot and not self._busy else "disabled")
         self.full_mode.configure(state="normal" if pairable and not self._busy else "disabled")
         self.dialogue_mode.configure(
             state="normal" if pairable and snapshot and snapshot.dialogue_index_available
@@ -870,10 +947,8 @@ class W3DualSubtitleApp:
     def _preview_generated(self, result):
         record, freshness = result
         if self.snapshot:
-            self.snapshot = GameSnapshot(
-                self.snapshot.selected, self.snapshot.manifest, self.snapshot.install_comparison,
-                record, freshness, self.snapshot.dialogue_index_available,
-            )
+            self.snapshot = replace(self.snapshot, generation_record=record,
+                                    generation_freshness=freshness)
         self._render_generation_and_install()
         self.status_var.set(
             f"Preview ready: {len(record.output_files)} target files; source freshness {freshness.value}. "

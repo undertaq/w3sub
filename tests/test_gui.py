@@ -163,6 +163,189 @@ class GuiHelperTests(unittest.TestCase):
     def candidate(self, game, label="registry fixture"):
         return GameCandidate(game.root, game.storefront, label, game.version.store_build_id)
 
+    def index_app(self, game):
+        """Exercise Tk callbacks with simple variables/widgets and a real queue."""
+        import queue
+        from types import SimpleNamespace
+
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        class Widget:
+            def __init__(self):
+                self.options = {}
+            def configure(self, **options):
+                self.options.update(options)
+            def start(self):
+                pass
+            def stop(self):
+                pass
+
+        app = gui_module.W3DualSubtitleApp.__new__(gui_module.W3DualSubtitleApp)
+        selected = gui_module.ScannedGame(self.candidate(game), game)
+        app.snapshot = gui_module.GameSnapshot(selected, None, None, None, None, False)
+        app.app_config = gui_module.AppConfig()
+        app.app_root = self.base / "app-state"
+        app._busy = False
+        app._progress_running = False
+        app._messages = queue.Queue()
+        app.logger = None
+        app.root = SimpleNamespace(after=lambda *_args: None)
+        app.converter_compatible = True
+        for name in ("game_details", "primary", "secondary", "mode_reason", "index_status", "status"):
+            setattr(app, name + "_var", Variable())
+        app.mode_var = Variable(MergeMode.FULL_TEXT.value)
+        for name in ("primary_combo", "secondary_combo", "full_mode", "dialogue_mode",
+                     "generate_button", "install_button", "modify_button", "uninstall_button",
+                     "index_build_button", "operation_progress"):
+            setattr(app, name, Widget())
+        app._render_generation_and_install = lambda: None
+        app._set_candidate_values = lambda: None
+        app._set_controls_enabled = lambda _enabled: None
+        return app
+
+    def test_missing_or_stale_index_disables_dialogue_and_offers_build(self):
+        game = self.make_game("index-state")
+        app = self.index_app(game)
+        for state in ("missing", "stale"):
+            with self.subTest(state=state), patch("w3sub_app.gui.config.save_config"), \
+                 patch("w3sub_app.gui.detect_configured_text_language", return_value="zh"):
+                snapshot = replace(app.snapshot, dialogue_index_state=state,
+                                   dialogue_index_reason="content/sample.bundle: rebuild required")
+                app._apply_snapshot(snapshot)
+                self.assertEqual(app.dialogue_mode.options["state"], "disabled")
+                self.assertEqual(app.index_build_button.options["state"], "normal")
+                self.assertIn(state.capitalize(), app.index_status_var.get())
+                self.assertIn("content/sample.bundle", app.mode_reason_var.get())
+                self.assertEqual((app.primary_var.get(), app.secondary_var.get()), ("zh", "en"))
+
+    def test_index_build_runs_in_worker_and_refreshes_selected_game(self):
+        import threading
+        game = self.make_game("index-worker")
+        app = self.index_app(game)
+        caller = threading.current_thread()
+        observed = []
+        ready = replace(app.snapshot, dialogue_index_available=True, dialogue_index_state="ready")
+        def build(scanned, progress_callback):
+            observed.append((threading.current_thread(), scanned.root))
+            progress_callback(2, 4)
+            return object()
+        def load(selected):
+            observed.append((threading.current_thread(), selected.game.root))
+            return ready
+        applied = []
+        app._apply_snapshot = applied.append
+        with patch("w3sub_app.gui.build_dialogue_index", side_effect=build), \
+             patch("w3sub_app.gui.scan_selected_folder", return_value=game), \
+             patch.object(app, "_load_game_snapshot", side_effect=load), \
+             patch("w3sub_app.gui.storefronts.refresh_candidate", return_value=self.candidate(game)):
+            worker = app._build_dialogue_index()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            progress = app._messages.get_nowait()
+            self.assertEqual(progress[0], "dialogue index progress")
+            app._messages.put(progress)
+            app._poll_messages()
+        self.assertEqual(len(observed), 2)
+        self.assertTrue(all(thread is not caller for thread, _root in observed))
+        self.assertEqual(applied, [ready])
+        self.assertIn("ready", app.status_var.get().casefold())
+
+    def test_index_failure_preserves_full_text_generation(self):
+        game = self.make_game("index-failure")
+        app = self.index_app(game)
+        app.primary_var.set("en")
+        app.secondary_var.set("zh")
+        with patch("w3sub_app.gui.build_dialogue_index", side_effect=RuntimeError(
+                "content/scripts/sample.ws: unaudited loose resource format")), \
+             patch("w3sub_app.gui.scan_selected_folder", return_value=game), \
+             patch("w3sub_app.gui.storefronts.refresh_candidate", return_value=self.candidate(game)), \
+             patch("w3sub_app.gui.config.save_config"), \
+             self.assertLogs("w3dual_subtitle", level="ERROR"):
+            app._build_dialogue_index().join(timeout=2)
+            app._poll_messages()
+        self.assertEqual(app.snapshot.dialogue_index_state, "unavailable")
+        self.assertIn("content/scripts/sample.ws", app.mode_reason_var.get())
+        self.assertEqual(app.full_mode.options["state"], "normal")
+        self.assertEqual(app.generate_button.options["state"], "normal")
+        self.assertEqual(app.dialogue_mode.options["state"], "disabled")
+        self.assertEqual(app.index_build_button.options["state"], "normal")
+
+    def test_detected_primary_default_survives_index_refresh(self):
+        for detected, expected in (("zh", ("zh", "en")), ("en", ("en", "zh"))):
+            app = self.index_app(self.make_game("index-default-" + detected))
+            with patch("w3sub_app.gui.config.save_config"), \
+                 patch("w3sub_app.gui.detect_configured_text_language", return_value=detected):
+                app._apply_snapshot(app.snapshot)
+                ready = replace(app.snapshot, dialogue_index_available=True, dialogue_index_state="ready")
+                app._dialogue_index_built(ready)
+                self.assertEqual((app.primary_var.get(), app.secondary_var.get()), expected)
+                app.primary_var.set(expected[1])
+                app.secondary_var.set(expected[0])
+                app._dialogue_index_built(ready)
+                self.assertEqual((app.primary_var.get(), app.secondary_var.get()), expected[::-1])
+
+    def test_old_root_index_result_does_not_replace_selected_game(self):
+        app = self.index_app(self.make_game("index-old"))
+        old_result = app.snapshot
+        app.snapshot = self.index_app(self.make_game("index-new")).snapshot
+        selected = app.snapshot
+        with patch.object(app, "_apply_snapshot") as apply:
+            app._dialogue_index_built(old_result)
+        apply.assert_not_called()
+        self.assertIs(app.snapshot, selected)
+
+    def test_cached_index_validation_does_not_build_or_run_on_tk_thread(self):
+        import threading
+        game = self.make_game("index-cache")
+        app = self.index_app(game)
+        caller = threading.current_thread()
+        observed = []
+        def cached(_game):
+            observed.append(threading.current_thread())
+            return None
+        with patch("w3sub_app.gui.generation._current_dialogue_index", side_effect=cached), \
+             patch("w3sub_app.gui.build_dialogue_index") as build, \
+             patch("w3sub_app.gui.install.load_install_manifest", return_value=None), \
+             patch("w3sub_app.gui.generation.load_latest_generation_record", return_value=None):
+            worker = start_background_operation(app._messages, "fixture cached scan",
+                lambda: app._load_game_snapshot(app.snapshot.selected), lambda _value: None)
+            worker.join(timeout=2)
+        build.assert_not_called()
+        self.assertEqual(len(observed), 1)
+        self.assertIsNot(observed[0], caller)
+
+    def test_expected_coverage_failure_reads_persisted_status_on_worker(self):
+        game = self.make_game("index-coverage")
+        app = self.index_app(game)
+        state = self.base / "index-state"
+        state.mkdir()
+        reason = "content/content0/ar.w3strings: unaudited loose resource format"
+        def build(_game, progress_callback):
+            (state / "dialogue-index-status.json").write_text(json.dumps({
+                "state": "unavailable", "diagnostic": reason,
+            }), encoding="utf-8")
+            return None
+        with patch("w3sub_app.gui.config.state_root_for", return_value=state), \
+             patch("w3sub_app.dialogue_index._state_directory", return_value=state), \
+             patch("w3sub_app.gui.generation._current_dialogue_index", return_value=None), \
+             patch("w3sub_app.gui.install.load_install_manifest", return_value=None), \
+             patch("w3sub_app.gui.generation.load_latest_generation_record", return_value=None), \
+             patch("w3sub_app.gui.build_dialogue_index", side_effect=build), \
+             patch("w3sub_app.gui.scan_selected_folder", return_value=game), \
+             patch("w3sub_app.gui.storefronts.refresh_candidate", return_value=self.candidate(game)), \
+             patch("w3sub_app.gui.config.save_config"):
+            app._build_dialogue_index().join(timeout=2)
+            app._poll_messages()
+        self.assertEqual(app.snapshot.dialogue_index_state, "unavailable")
+        self.assertIn(reason, app.mode_reason_var.get())
+        self.assertEqual(app.full_mode.options["state"], "normal")
+
     def test_startup_candidates_preserve_discovery_priority_then_add_saved_fallback(self):
         discovered = self.make_game("registry-game")
         saved = self.make_game("saved-game")
