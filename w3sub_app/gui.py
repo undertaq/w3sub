@@ -7,12 +7,14 @@ import queue
 import re
 import sys
 import threading
+from typing import Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import config, generation, install, storefronts
 from .converter import CompatibilityReport, W3StringsConverter, check_compatibility
 from .w3strings_native import NativeW3StringsCodec
+from .progress import ProgressCallback, ProgressUpdate
 from .game import detect_configured_text_language, scan_game
 from .models import (
     AppConfig, Freshness, GameCandidate, GameInstallation, GenerationRecord,
@@ -323,14 +325,18 @@ def summarize_compatibility_error(error: str | None) -> str:
     return f"{count}{first_line}. Full diagnostics: {log_path}"
 
 
-def start_background_operation(messages: queue.Queue, label: str, operation,
+def start_background_operation(messages: queue.Queue, label: str,
+                               operation: Callable[[ProgressCallback], object],
                                on_success, logger: logging.Logger | None = None):
-    """Run work away from Tk and post one result for the UI's after() poller."""
+    """Run work away from Tk and queue progress and the final result."""
     logger = logger or logging.getLogger(config._LOGGER_NAME)
+
+    def progress_callback(update: ProgressUpdate):
+        messages.put(("operation progress", (label, update), None))
 
     def worker():
         try:
-            result = operation()
+            result = operation(progress_callback)
         except Exception as error:
             logger.exception("Background operation %s failed", label)
             messages.put((label, None, error))
@@ -498,6 +504,12 @@ class W3DualSubtitleApp:
         try:
             while True:
                 label, payload, error = self._messages.get_nowait()
+                if label == "operation progress":
+                    _operation_label, update = payload
+                    counts = (f" {update.completed}/{update.total}"
+                              if update.total is not None else "")
+                    self.status_var.set(update.phase + counts)
+                    continue
                 self._busy = False
                 if error is not None:
                     details = [str(error)]
@@ -546,7 +558,7 @@ class W3DualSubtitleApp:
                 state="normal" if self._unmatched_report_path() else "disabled"
             )
 
-    def _startup_scan(self):
+    def _startup_scan(self, progress_callback: ProgressCallback):
         candidates = storefronts.discover_candidates()
         rows = ordered_startup_games(candidates, self.app_config.last_game_root,
                                      logger=self.logger)
@@ -692,7 +704,7 @@ class W3DualSubtitleApp:
             self._rescan_to_candidate(selected)
 
     def _rescan_to_candidate(self, selected: ScannedGame):
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             candidate = storefronts.refresh_candidate(selected.candidate)
             game = scan_selected_folder(candidate.root, candidate=candidate)
             refreshed = ScannedGame(candidate, game)
@@ -715,7 +727,7 @@ class W3DualSubtitleApp:
             return
         candidate = GameCandidate(Path(chosen), Storefront.UNKNOWN, "manual selection")
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             game = scan_selected_folder(candidate.root, candidate=candidate)
             selected = ScannedGame(candidate, game)
             return selected, self._load_game_snapshot(selected)
@@ -776,7 +788,7 @@ class W3DualSubtitleApp:
         manifest = self.snapshot.manifest
         converter_raw = self.converter_var.get().strip()
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             converter = selected_converter(converter_raw)
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             return check_pair_compatibility(game, primary, secondary, converter,
@@ -882,24 +894,17 @@ class W3DualSubtitleApp:
         mode = MergeMode(self.mode_var.get())
         converter_raw = self.converter_var.get().strip()
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             game, _state, manifest, _comparison = self._fresh_game_and_manifest()
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             converter = selected_converter(converter_raw)
-            compatibility = check_pair_compatibility(
-                game, primary, secondary, converter, self.app_root, overrides or None,
-            )
-            if not compatibility.compatible:
-                self.logger.warning("Generation converter preflight failed: %s", compatibility.error)
-                raise generation.GenerationError(
-                    "Converter is incompatible with selected inputs: "
-                    + summarize_compatibility_error(compatibility.error)
-                )
             record = generation.generate(
                 GenerationRequest(game, primary, secondary, mode, overrides or None),
-                self.app_root, converter,
+                self.app_root, converter, progress_callback=progress_callback,
             )
-            freshness = generation.compare_generation(record, game, overrides or None)
+            freshness = generation.compare_generation(
+                record, game, overrides or None, progress_callback=progress_callback,
+            )
             return record, freshness
 
         self._submit("generate preview", operation, self._preview_generated)
@@ -947,7 +952,7 @@ class W3DualSubtitleApp:
             return
         record = self.snapshot.generation_record
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             game, state, manifest, _comparison = self._fresh_game_and_manifest()
             if manifest and manifest.active:
                 raise install.InstallError("An install is already active; use Modify or Uninstall")
@@ -976,7 +981,7 @@ class W3DualSubtitleApp:
             return
         reviewed_signature = install_manifest_review_signature(reviewed_manifest)
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             game, _state, manifest, _comparison = self._fresh_game_and_manifest(
                 reviewed_manifest_signature=reviewed_signature,
             )
@@ -1010,7 +1015,7 @@ class W3DualSubtitleApp:
         reviewed_manifest = self.snapshot.manifest
         reviewed_signature = install_manifest_review_signature(reviewed_manifest)
 
-        def operation():
+        def operation(progress_callback: ProgressCallback):
             game, _state, manifest, comparison = self._fresh_game_and_manifest(
                 allow_stale_install=True,
                 reviewed_manifest_signature=reviewed_signature,

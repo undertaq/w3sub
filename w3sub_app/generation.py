@@ -17,6 +17,7 @@ from .merge import (
     unmatched_native_entries,
 )
 from .converter import check_compatibility
+from .progress import ProgressCallback, report_progress
 from .w3strings_native import NativeW3StringsCodec
 from .models import (
     Freshness,
@@ -151,16 +152,19 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fingerprint_sources(sources: dict[str, Path]) -> ResourceFingerprint:
+def _fingerprint_sources(sources: dict[str, Path],
+                         progress_callback: ProgressCallback | None = None,
+                         phase: str = "Fingerprinting resources") -> ResourceFingerprint:
     entries = {}
     aggregate = hashlib.sha256()
-    for relative, path in sorted(sources.items()):
+    for number, (relative, path) in enumerate(sorted(sources.items()), start=1):
         digest = _hash_file(path)
         entries[relative] = digest
         encoded = relative.encode("utf-8")
         aggregate.update(len(encoded).to_bytes(8, "big"))
         aggregate.update(encoded)
         aggregate.update(bytes.fromhex(digest))
+        report_progress(progress_callback, phase, number, len(sources))
     return ResourceFingerprint(entries, aggregate.hexdigest())
 
 
@@ -239,7 +243,8 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
     }
 
 
-def generate(request: GenerationRequest, state_root: Path, converter=None) -> GenerationRecord:
+def generate(request: GenerationRequest, state_root: Path, converter=None, *,
+             progress_callback: ProgressCallback | None = None) -> GenerationRecord:
     """Generate into per-game app state and atomically publish its JSON record."""
     if converter is None:
         converter = NativeW3StringsCodec()
@@ -259,7 +264,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
     sources = _source_paths(request.game, primary_language, secondary_language,
                             request.source_overrides)
     try:
-        initial_fingerprint = _fingerprint_sources(sources)
+        initial_fingerprint = _fingerprint_sources(sources, progress_callback)
     except (OSError, ValueError) as error:
         raise GenerationError(f"Cannot fingerprint generation inputs: {error}") from error
 
@@ -291,18 +296,19 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
     try:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
             scratch = Path(scratch_name)
-            if native:
-                copied_sources = {}
-                for number, (relative, source) in enumerate(sorted(sources.items())):
-                    copied = scratch / "inputs" / str(number) / Path(relative).name
-                    copied.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, copied)
-                    copied_sources[relative] = copied
-                report = check_compatibility(copied_sources, converter, scratch / "compatibility")
-                if not report.compatible:
-                    raise GenerationError(f"Native codec compatibility check failed: {report.error}")
-            else:
-                copied_sources = sources
+            copied_sources = {}
+            for number, (relative, source) in enumerate(sorted(sources.items())):
+                copied = scratch / "inputs" / str(number) / Path(relative).name
+                copied.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, copied)
+                copied_sources[relative] = copied
+            report = check_compatibility(
+                copied_sources, converter, scratch / "compatibility",
+                progress_callback=progress_callback,
+            )
+            if not report.compatible:
+                codec_label = "Native codec" if native else "External converter"
+                raise GenerationError(f"{codec_label} compatibility check failed: {report.error}")
             for number, (_resource_parent, primary_relative, secondary_relative) in enumerate(pairs):
                 primary_csv = converter.decode(copied_sources[primary_relative],
                                                scratch / f"{number}-primary")
@@ -332,6 +338,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
                     )
                 except MergeError as error:
                     raise GenerationError(f"Cannot merge {primary_relative}: {error}") from error
+                report_progress(progress_callback, "Merging resource pairs",
+                                number + 1, len(pairs))
                 encoded = converter.encode(merged_csv, scratch / f"{number}-encoded")
                 target = generation_dir.joinpath(*PurePosixPath(primary_relative).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -340,9 +348,13 @@ def generate(request: GenerationRequest, state_root: Path, converter=None) -> Ge
                         output.write(chunk)
                 output_files[primary_relative] = str(target.resolve())
                 output_hashes[primary_relative] = _hash_file(target)
+                report_progress(progress_callback, "Encoding output files",
+                                number + 1, len(pairs))
 
         try:
-            final_fingerprint = _fingerprint_sources(sources)
+            final_fingerprint = _fingerprint_sources(
+                sources, progress_callback, "Rechecking generation inputs",
+            )
         except (OSError, ValueError) as error:
             raise GenerationError(f"Cannot recheck generation inputs: {error}") from error
         if final_fingerprint != initial_fingerprint:
@@ -605,7 +617,8 @@ def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
 
 
 def compare_generation(record: GenerationRecord, game: GameInstallation,
-                       source_overrides: dict[str, Path] | None = None) -> Freshness:
+                       source_overrides: dict[str, Path] | None = None, *,
+                       progress_callback: ProgressCallback | None = None) -> Freshness:
     """Compare staged inputs and outputs with a freshly scanned install."""
     if _normalized_game_root(record.game_root) != _normalized_game_root(game.root):
         return Freshness.STALE
@@ -614,7 +627,7 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
     try:
         sources = _source_paths(game, record.primary_language,
                                  record.secondary_language, source_overrides)
-        current_fingerprint = _fingerprint_sources(sources)
+        current_fingerprint = _fingerprint_sources(sources, progress_callback)
     except (OSError, PermissionError):
         return Freshness.UNREADABLE
     except (GenerationError, ValueError):

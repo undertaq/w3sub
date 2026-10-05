@@ -8,6 +8,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 from .merge import MergeError, _Record, _read_csv
 from .w3strings_native import NativeW3StringsCodec
+from .progress import ProgressCallback, report_progress
 
 
 class ConverterError(RuntimeError):
@@ -32,7 +33,8 @@ def _semantic_records(path: Path) -> tuple[tuple[tuple[str, str], str, str], ...
 
 
 def check_compatibility(sources: dict[str, Path], converter,
-                        work_dir: Path) -> CompatibilityReport:
+                        work_dir: Path, *,
+                        progress_callback: ProgressCallback | None = None) -> CompatibilityReport:
     """Probe every selected resource by round-tripping isolated copies.
 
     Comparing parsed records ignores harmless comment/line-ending changes but
@@ -78,6 +80,8 @@ def check_compatibility(sources: dict[str, Path], converter,
                         )
                 except Exception as error:
                     errors.append(f"{relative}: {error}")
+                report_progress(progress_callback, "Checking resource compatibility",
+                                number + 1, len(inventory))
     except Exception as error:
         errors.append(f"Cannot run converter compatibility check: {error}")
     return CompatibilityReport(not errors, len(inventory), "\n".join(errors) if errors else None)
