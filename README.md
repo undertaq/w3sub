@@ -4,16 +4,33 @@ A Windows desktop app for generating and managing a two-language `.w3strings` up
 
 ## Requirements and launch
 
-- Windows with Python 3.10 or newer and Tkinter (included with the standard Windows Python installer).
+- Windows. The standalone executable includes Python and Tkinter; no separate Python installation is required.
 - The game installed through Steam, GOG, or Epic Games, or its game folder available for manual selection.
 
-From this project folder, run:
+Launch `W3DualSubtitleManager.exe` from the executable download or build output. To launch from a local build:
+
+```powershell
+.\dist\W3DualSubtitleManager.exe
+```
+
+For source launch, install Python 3.10 or newer with Tkinter (included with the standard Windows Python installer), then run from this project folder:
 
 ```powershell
 python w3sub.py
 ```
 
 This opens the GUI. Starting the program only discovers and scans game folders; it does not generate or install files automatically.
+
+## Build the Windows executable
+
+Build on Windows x64 with Python 3.14 and Tkinter. PyInstaller builds for the platform running it; this recipe produces a single-file, windowed Windows executable.
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\build.ps1
+```
+
+The output is `dist/W3DualSubtitleManager.exe`. The build includes the app, Python/Tk runtime, built-in codec, and its license and notice. Game resources, user data/backups, the WolvenKit helper, and optional external converters are excluded. Custom converters remain external executables selected at runtime with **Browse**. Configuration, logs, and recovery data continue to use the per-user application-data folder described below.
 
 ## Select and scan the game
 
@@ -33,7 +50,7 @@ Hashless matching is a heuristic based on the decoded `.w3strings` association t
 
 The keyless rule may classify non-dialogue text without key hashes as dialogue; the unmatched report helps inspect language identities that did not pair.
 
-The **built-in codec** is the default and requires only the Python standard library. It supports verified formats **162–163 (UTF-16LE)** and **164 (strict UTF-8)**. Before enabling generation, the app checks copies of every selected resource through decode/encode/decode, comparing container version, language key, every string ID and text, and every localization-key association. Generation repeats this gate over isolated copies. Embedded CR, LF, and CRLF text is preserved exactly through structured merging. Unknown formats or language keys, invalid Unicode, duplicate string IDs, and exact repeated key associations fail closed.
+The **built-in codec** is the default and requires only the Python standard library. It supports verified formats **162–163 (UTF-16LE)** and **164 (strict UTF-8)**. Startup and selection changes check resource paths, pairing, and codec availability. During preview generation, the app checks isolated copies of every selected resource once through decode/encode/decode, comparing container version, language key, every string ID and text, and every localization-key association before publishing output. Embedded CR, LF, and CRLF text is preserved exactly through structured merging. Unknown formats or language keys, invalid Unicode, duplicate string IDs, and exact repeated key associations fail closed.
 
 Full text matches keyless IDs by string ID and keyed entries by string ID plus a shared key hash. Dialogue only uses the same keyless-ID criterion and excludes keyed entries. Western terminal punctuation includes `.`, `?`, `!`, and `,`; Chinese, Japanese, Korean, Arabic, Persian, and Urdu use their corresponding punctuation marks. A new `unmatched_entries.csv` is saved in each generation folder and lists unmatched identities from both selected languages, including resource, language, side, ID, key hash, text, and reason. Use **Open unmatched list** in the preview to view it. All primary associations survive, including distinct hashes for one ID and references to IDs stored in other resources.
 
