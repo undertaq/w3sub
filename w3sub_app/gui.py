@@ -1,6 +1,5 @@
 """Tkinter desktop flow for the Witcher 3 dual-subtitle manager."""
 from dataclasses import dataclass, replace
-import json
 import logging
 import os
 from pathlib import Path
@@ -14,7 +13,6 @@ from tkinter import filedialog, messagebox, ttk
 from . import config, generation, install, storefronts
 from .converter import CompatibilityReport, W3StringsConverter, check_compatibility
 from .w3strings_native import NativeW3StringsCodec
-from .dialogue_index import build_dialogue_index, dialogue_index_unavailable_reason
 from .game import detect_configured_text_language, scan_game
 from .models import (
     AppConfig, Freshness, GameCandidate, GameInstallation, GenerationRecord,
@@ -56,9 +54,6 @@ class GameSnapshot:
     install_comparison: InstallComparison | None
     generation_record: GenerationRecord | None
     generation_freshness: Freshness | None
-    dialogue_index_available: bool
-    dialogue_index_state: str = "missing"
-    dialogue_index_reason: str = ""
 
 
 def _merge_summary(record: GenerationRecord) -> str | None:
@@ -189,7 +184,7 @@ def build_action_state(*, has_game: bool, primary: str | None, secondary: str | 
                        converter_compatible: bool, generated: bool,
                        generation_freshness: Freshness | None, install_active: bool,
                        install_comparison: InstallComparison | Freshness | None,
-                       conflict_paths: tuple[str, ...], dialogue_index_current: bool
+                       conflict_paths: tuple[str, ...]
                        ) -> ActionState:
     """Centralize action gates so every lifecycle path fails closed."""
     compare_freshness = getattr(install_comparison, "freshness", install_comparison)
@@ -418,27 +413,20 @@ class W3DualSubtitleApp:
 
         mode = ttk.Frame(frame)
         mode.grid(row=5, column=0, columnspan=3, sticky="ew", pady=4)
-        self.mode_var = tk.StringVar(value=MergeMode.FULL_TEXT.value)
-        self.full_mode = ttk.Radiobutton(
-            mode, text="Full-text merge", variable=self.mode_var,
-            value=MergeMode.FULL_TEXT.value, command=self._mode_changed,
-        )
-        self.full_mode.grid(row=0, column=0, sticky="w")
+        self.mode_var = tk.StringVar(value=MergeMode.DIALOGUE_ONLY.value)
         self.dialogue_mode = ttk.Radiobutton(
             mode, text="Dialogue-only merge", variable=self.mode_var,
             value=MergeMode.DIALOGUE_ONLY.value, command=self._mode_changed,
         )
-        self.dialogue_mode.grid(row=0, column=1, sticky="w", padx=12)
-        self.index_build_button = ttk.Button(
-            mode, text="Build optional Dialogue Index", command=self._build_dialogue_index,
+        self.dialogue_mode.grid(row=0, column=0, sticky="w")
+        self.full_mode = ttk.Radiobutton(
+            mode, text="Full-text merge", variable=self.mode_var,
+            value=MergeMode.FULL_TEXT.value, command=self._mode_changed,
         )
-        self.index_build_button.grid(row=0, column=2, sticky="w")
-        self.index_status_var = tk.StringVar(value="Dialogue index: missing")
-        ttk.Label(mode, textvariable=self.index_status_var).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        self.full_mode.grid(row=0, column=1, sticky="w", padx=12)
         self.mode_reason_var = tk.StringVar()
         ttk.Label(mode, textvariable=self.mode_reason_var, wraplength=780).grid(
-            row=2, column=0, columnspan=3, sticky="ew")
+            row=1, column=0, columnspan=2, sticky="ew")
 
         actions = ttk.Frame(frame)
         actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(5, 7))
@@ -510,12 +498,6 @@ class W3DualSubtitleApp:
         try:
             while True:
                 label, payload, error = self._messages.get_nowait()
-                if label == "dialogue index progress":
-                    root, done, total = payload
-                    if (self._busy and self.snapshot and
-                            _path_identity(self.snapshot.selected.game.root) == root):
-                        self.index_status_var.set(f"Dialogue index: Building ({done:,}/{total:,})")
-                    continue
                 self._busy = False
                 if error is not None:
                     details = [str(error)]
@@ -548,7 +530,7 @@ class W3DualSubtitleApp:
         state = "normal" if enabled else "disabled"
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
                        self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
-                       self.full_mode, self.dialogue_mode, self.rescan_button, self.index_build_button,
+                       self.full_mode, self.dialogue_mode, self.rescan_button,
                        self.unmatched_button):
             try:
                 widget.configure(state=state)
@@ -610,56 +592,7 @@ class W3DualSubtitleApp:
                 freshness = generation.compare_generation(record, game, overrides or None)
             except Exception:
                 freshness = Freshness.STALE
-        dialogue_index = generation._current_dialogue_index(game)
-        reason = "" if dialogue_index is not None else dialogue_index_unavailable_reason(game)
-        index_state = "ready" if dialogue_index is not None else "missing"
-        if dialogue_index is None:
-            try:
-                status = json.loads((state_root / "dialogue-index-status.json").read_text(encoding="utf-8"))
-                if status.get("state") in ("stale", "unavailable"):
-                    index_state = status["state"]
-            except (OSError, ValueError, AttributeError, UnicodeError):
-                pass
-        return GameSnapshot(selected, manifest, comparison, record, freshness,
-                            dialogue_index is not None, index_state, reason)
-
-    def _build_dialogue_index(self):
-        if self._busy or self.snapshot is None:
-            return
-        original = self.snapshot
-        selected = original.selected
-        root_identity = _path_identity(selected.game.root)
-        self.snapshot = replace(original, dialogue_index_available=False,
-                                dialogue_index_state="building")
-        self.index_status_var.set("Dialogue index: Building — inventory scan…")
-        self.mode_reason_var.set("Scanning active resources; this first build can take time.")
-
-        def progress(done, total):
-            self._messages.put(("dialogue index progress", (root_identity, done, total), None))
-
-        def operation():
-            try:
-                candidate = storefronts.refresh_candidate(selected.candidate)
-                game = scan_selected_folder(candidate.root, candidate=candidate)
-                build_dialogue_index(game, progress_callback=progress)
-                # Cache validation (including hashing) stays on this worker.
-                return self._load_game_snapshot(ScannedGame(candidate, game))
-            except Exception as error:
-                logger = self.logger or logging.getLogger(config._LOGGER_NAME)
-                logger.exception("Dialogue index build failed")
-                return replace(original, dialogue_index_available=False,
-                               dialogue_index_state="unavailable",
-                               dialogue_index_reason=f"{error}. Full-text merge remains available.")
-
-        return self._submit("build dialogue index", operation, self._dialogue_index_built)
-
-    def _dialogue_index_built(self, snapshot: GameSnapshot):
-        if (self.snapshot is None or _path_identity(self.snapshot.selected.game.root) !=
-                _path_identity(snapshot.selected.game.root)):
-            return
-        self._apply_snapshot(snapshot)
-        self.status_var.set("Dialogue index ready" if snapshot.dialogue_index_available else
-                            snapshot.dialogue_index_reason)
+        return GameSnapshot(selected, manifest, comparison, record, freshness)
 
     def _apply_snapshot(self, snapshot: GameSnapshot):
         self.snapshot = snapshot
@@ -687,8 +620,6 @@ class W3DualSubtitleApp:
             "Dialogue-only uses entries with no key hash in both languages, matched by string ID. "
             "Merged text uses <br> after terminal punctuation; otherwise it uses a space."
         )
-        self.index_status_var.set("Optional index: " + (
-            "Ready" if snapshot.dialogue_index_available else snapshot.dialogue_index_state.capitalize()))
         self.dialogue_mode.configure(state="normal")
         self._render_generation_and_install()
         self._set_candidate_values()
@@ -903,10 +834,8 @@ class W3DualSubtitleApp:
             generation_freshness=snapshot.generation_freshness if snapshot else None,
             install_active=active, install_comparison=comparison,
             conflict_paths=conflicts,
-            dialogue_index_current=bool(snapshot and snapshot.dialogue_index_available),
         )
         pairable = self._resources_pairable()
-        self.index_build_button.configure(state="normal" if snapshot and not self._busy else "disabled")
         self.full_mode.configure(state="normal" if pairable and not self._busy else "disabled")
         self.dialogue_mode.configure(
             state="normal" if pairable and snapshot and not self._busy else "disabled"

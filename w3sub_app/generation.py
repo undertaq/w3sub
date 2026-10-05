@@ -8,7 +8,6 @@ import tempfile
 import uuid
 import shutil
 
-from .dialogue_index import INDEX_SCHEMA_VERSION, load_dialogue_index
 from .merge import (
     MergeError,
     MergeStats,
@@ -176,23 +175,6 @@ def _hash_executable(converter) -> tuple[Path, str]:
         return resolved, _hash_file(resolved)
     except (OSError, TypeError) as error:
         raise GenerationError(f"Cannot identify converter executable: {error}") from error
-
-
-def _current_dialogue_index(game: GameInstallation):
-    # load_dialogue_index already validates inventory, payloads and helper.
-    # Every caller still loads afresh at its publication/install boundary.
-    index = load_dialogue_index(game)
-    if (getattr(index, "validated", False) is not True
-            or not callable(getattr(index, "is_current", None))
-            or not callable(getattr(index, "context_for", None))
-            or not callable(getattr(index, "context_for_id", None))
-            or type(getattr(index, "schema_version", None)) is not int
-            or index.schema_version != INDEX_SCHEMA_VERSION):
-        return None
-    digest = getattr(index, "digest", None)
-    if not isinstance(digest, str) or not digest:
-        return None
-    return index
 
 
 def _version_payload(version: GameVersion) -> dict[str, str | None]:

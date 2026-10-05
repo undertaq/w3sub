@@ -889,15 +889,6 @@ def _freshness(manifest: InstallManifest, game: GameInstallation) -> Freshness:
         return Freshness.STALE
     if fingerprint != manifest.source_fingerprint:
         return Freshness.STALE
-    if manifest.mode is MergeMode.DIALOGUE_ONLY:
-        try:
-            index = generation._current_dialogue_index(game)
-        except OSError:
-            return Freshness.UNREADABLE
-        if index is None or index.digest != manifest.classifier_digest:
-            return Freshness.STALE
-    elif manifest.classifier_digest is not None:
-        return Freshness.STALE
     if game.version != manifest.install_version:
         return Freshness.VERSION_METADATA_CHANGED_ONLY
     return Freshness.CURRENT

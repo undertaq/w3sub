@@ -27,11 +27,9 @@ When the language menus load, the app reads the active `TextLanguage` from the c
 
 Choose different **Primary** and **Secondary** languages from the detected menus. The primary language is the output resource and stays first in each merged record. Entries with no key hash in either language are treated as dialogue and paired by string ID; entries with keys are paired by string ID plus a shared key hash. The separator is based on the selected language text: the app checks the Western-language entry when the pair contains one, otherwise the primary entry. It inserts `<br>` only when that text ends with a locale-appropriate terminal punctuation mark (optionally followed by a closing quote); otherwise it inserts a space. Primary-only records remain, while records that exist only in the secondary file are not added.
 
-Full-text mode processes all matching dialogue and keyed records in the selected resources. Dialogue-only mode merges only the hashless entries that also exist in the secondary language, matched by string ID. It does not require the optional dialogue-reference index.
+Dialogue-only is the default mode. It merges entries with no key hash in both selected languages, matched by string ID. Full-text mode processes all matching dialogue and keyed records in the selected resources.
 
 Hashless matching is a heuristic based on the decoded `.w3strings` association table. Any entry with no key hash in both selected files is treated as dialogue for this mode.
-
-The optional **Build Dialogue Index** action remains available for reference analysis, but it does not gate generation or classify entries in the current merge policy.
 
 The keyless rule may classify non-dialogue text without key hashes as dialogue; the unmatched report helps inspect language identities that did not pair.
 
@@ -40,8 +38,6 @@ The **built-in codec** is the default and requires only the Python standard libr
 Full text matches keyless IDs by string ID and keyed entries by string ID plus a shared key hash. Dialogue only uses the same keyless-ID criterion and excludes keyed entries. Western terminal punctuation includes `.`, `?`, `!`, and `,`; Chinese, Japanese, Korean, Arabic, Persian, and Urdu use their corresponding punctuation marks. A new `unmatched_entries.csv` is saved in each generation folder and lists unmatched identities from both selected languages, including resource, language, side, ID, key hash, text, and reason. Use **Open unmatched list** in the preview to view it. All primary associations survive, including distinct hashes for one ID and references to IDs stored in other resources.
 
 Use **Browse** beside the codec selection to explicitly choose an external executable for the legacy CSV path, or **Use built-in** to clear that saved override. The external path retains its line-oriented CSV limitations for embedded line breaks. The old `w3strings.exe` v0.4.1 supports only formats 162–163 and will fail compatibility checks on format 164. The built-in string codec needs no converter download, .NET runtime, or third-party Python dependency. Codec attribution and the upstream MIT license are in `w3sub_app/third_party/w3strings_codec/`.
-
-Optional dialogue-reference indexing uses the separate bundled WolvenKit 7 v164 helper process under `tools/wolvenkit7-v164/`, requiring Windows x64 and .NET Framework 4.8.1. That directory contains the GPLv3 license, third-party notices, pinned binary identity, build recipe, patch, and split complete corresponding source archive (`wolvenkit7-v164-corresponding-source.zip.001` / `.002`). Keep the helper binaries and matching source parts together when distributing the program; see [the helper instructions](tools/wolvenkit7-v164/README.md). Cached indexes store IDs, contexts and provenance rather than localized game text.
 
 Once compatibility passes, choose **Generate preview**. The preview status reports merged primary entries out of total primary entries processed and their percentage, plus the unmatched identity count. Generated files, the unmatched CSV, and a record of the selected pair, game version, input hashes, codec kind, implementation path/version/SHA-256 (or external converter identity), output hashes, and merge counts are written to application data, outside the game folder. Review the exact target paths and hashes shown by the GUI before continuing.
 
@@ -52,6 +48,8 @@ Once compatibility passes, choose **Generate preview**. The preview status repor
 - **Uninstall** restores originals only when each managed game file still matches the hash saved for the installed version. Original backups are retained after uninstall.
 
 The app checks for a running Witcher 3 process before changing game files. It stores the game version and source-resource fingerprints at generation and install time, then compares them at startup and after a folder change. If source resources change after a game update, the preview is stale and must be regenerated. If an active install is stale, uninstall it safely before generating a replacement. A version metadata change with unchanged source resources is tracked separately from changed resource contents.
+
+Historical generation records and install manifests remain readable. A legacy classifier digest does not affect freshness or safe uninstall; restoration uses the saved target hashes and validated original backups.
 
 If a managed file or backup no longer matches its saved hash, the app reports the exact conflict paths and backup location and preserves the unexpected data. It will not overwrite a conflicting file during uninstall. Resolve the conflict manually, using the retained originals under the backup directory if recovery is needed, then rescan the game.
 
@@ -70,8 +68,6 @@ The selected game path is saved in `config.json`. Per-game state is keyed by the
 ```
 
 Original install backups are kept under that per-game state folder in `backups\<install-id>\`. Keep this directory until you no longer need uninstall or manual recovery.
-
-`dialogue-index.json` holds a successfully completed index; `dialogue-index-status.json` records coverage failures and stale-cache diagnostics. Temporary extracted resources are removed after the index scan. Index building reads the game resources and writes its cache outside the game installation.
 
 ## Testing and live-game safety
 
