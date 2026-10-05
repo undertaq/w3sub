@@ -12,9 +12,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import config, generation, install, storefronts
-from .converter import CompatibilityReport, W3StringsConverter, check_compatibility
+from .converter import W3StringsConverter
 from .w3strings_native import NativeW3StringsCodec
-from .progress import ProgressCallback, ProgressUpdate
+from .progress import ProgressCallback, ProgressUpdate, report_progress
+from .help_dialog import show_help
+from .tooltips import attach_tooltip
 from .game import detect_configured_text_language, scan_game
 from .models import (
     AppConfig, Freshness, GameCandidate, GameInstallation, GenerationRecord,
@@ -75,36 +77,45 @@ def _path_identity(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(resolved)))
 
 
-def ordered_startup_games(candidates, saved_game_root: Path | None, *, scanner=None,
+def ordered_startup_games(candidates, saved_game_root: Path | None, *,
+                          progress_callback: ProgressCallback | None = None, scanner=None,
                           logger: logging.Logger | None = None) -> tuple[ScannedGame, ...]:
-    """Scan storefront candidates first; append a valid saved path as fallback."""
+    """Scan discovered candidates, then try a saved path as a fallback."""
     scanner = scanner or scan_game
     logger = logger or logging.getLogger(config._LOGGER_NAME)
+    candidates = tuple(candidates)
     rows = []
     seen = set()
-    for candidate in candidates:
+    for number, candidate in enumerate(candidates, 1):
         identity = _path_identity(candidate.root)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        try:
-            game = scanner(candidate.root, candidate.storefront, candidate.store_build_id)
-        except Exception as error:
-            logger.info("Skipping discovered game candidate %s: %s", candidate.root, error)
-            continue
-        rows.append(ScannedGame(candidate, game))
+        outcome = "skipped duplicate"
+        if identity not in seen:
+            seen.add(identity)
+            report_progress(progress_callback, f"Enumerating game resources: {candidate.root}", 0, None)
+            try:
+                game = scanner(candidate.root, candidate.storefront, candidate.store_build_id)
+            except Exception as error:
+                logger.info("Skipping discovered game candidate %s: %s", candidate.root, error)
+                outcome = "skipped unusable"
+            else:
+                rows.append(ScannedGame(candidate, game))
+                outcome = "scanned"
+        report_progress(progress_callback, f"Scanning installations ({outcome})", number, len(candidates))
     if saved_game_root is not None:
         identity = _path_identity(saved_game_root)
         if not any(_path_identity(row.game.root) == identity for row in rows):
             candidate = GameCandidate(Path(saved_game_root), Storefront.UNKNOWN,
                                       "saved settings", None)
+            report_progress(progress_callback, "Enumerating saved game resources", 0, None)
             try:
                 game = scanner(candidate.root, candidate.storefront, None)
             except Exception as error:
-                logger.info("Saved game folder is no longer usable %s: %s",
-                            candidate.root, error)
+                logger.info("Saved game folder is no longer usable %s: %s", candidate.root, error)
+                outcome = "skipped unusable"
             else:
                 rows.append(ScannedGame(candidate, game))
+                outcome = "scanned"
+            report_progress(progress_callback, f"Scanning saved installation ({outcome})", 1, 1)
     return tuple(rows)
 
 
@@ -159,31 +170,9 @@ def source_overrides_for_pair(game: GameInstallation, manifest: InstallManifest 
     return overrides
 
 
-def check_pair_compatibility(game: GameInstallation, primary: str, secondary: str,
-                             converter, app_state: Path,
-                             source_overrides: dict[str, Path] | None = None
-                             ) -> CompatibilityReport:
-    """Round-trip the complete pair inventory and reject concurrent source edits."""
-    try:
-        sources = generation._source_paths(game, primary, secondary, source_overrides)
-        before = generation._fingerprint_sources(sources)
-    except Exception as error:
-        return CompatibilityReport(False, 0, f"Cannot inspect selected language resources: {error}")
-    report = check_compatibility(sources, converter, Path(app_state) / "compatibility")
-    try:
-        after = generation._fingerprint_sources(sources)
-    except Exception as error:
-        return CompatibilityReport(False, report.checked_resources,
-                                   f"Cannot recheck selected language resources: {error}")
-    if before != after:
-        return CompatibilityReport(False, report.checked_resources,
-                                   "A selected language resource changed during compatibility check")
-    return report
-
-
 def build_action_state(*, has_game: bool, primary: str | None, secondary: str | None,
                        mode: MergeMode, resources_available: bool,
-                       converter_compatible: bool, generated: bool,
+                       codec_available: bool, generated: bool,
                        generation_freshness: Freshness | None, install_active: bool,
                        install_comparison: InstallComparison | Freshness | None,
                        conflict_paths: tuple[str, ...]
@@ -198,7 +187,7 @@ def build_action_state(*, has_game: bool, primary: str | None, secondary: str | 
     pair_valid = bool(primary and secondary and primary.casefold() != secondary.casefold())
     safe_to_generate = not conflicts and not active_stale
     can_generate = bool(has_game and pair_valid and resources_available
-                        and converter_compatible and safe_to_generate)
+                        and codec_available and safe_to_generate)
     fresh_generation = generation_freshness in (
         Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY,
     )
@@ -358,14 +347,15 @@ class W3DualSubtitleApp:
         self.converter_path = self.app_config.converter_path
         self._messages: queue.Queue = queue.Queue()
         self._busy = False
-        self._progress_running = False
         self._candidate_rows: tuple[ScannedGame, ...] = ()
         self.snapshot: GameSnapshot | None = None
-        self.converter_compatible = False
+        self.codec_available = False
         self._allow_game_value_event = False
         self._build_widgets()
         self.root.title("Witcher 3 Dual Subtitle Manager")
-        self.root.minsize(760, 630)
+        self.root.geometry("900x560")
+        self.root.minsize(760, 520)
+        self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self._poll_messages)
         self._submit("startup", self._startup_scan, self._startup_loaded)
@@ -373,7 +363,7 @@ class W3DualSubtitleApp:
     def _build_widgets(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        frame = ttk.Frame(self.root, padding=12)
+        frame = ttk.Frame(self.root, padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(8, weight=1)
@@ -388,7 +378,7 @@ class W3DualSubtitleApp:
 
         self.game_details_var = tk.StringVar(value="Scanning storefront records…")
         ttk.Label(frame, textvariable=self.game_details_var, wraplength=780).grid(
-            row=1, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+            row=1, column=0, columnspan=4, sticky="ew", pady=(0, 5))
         ttk.Label(frame, text="Codec / external override").grid(row=2, column=0, sticky="w")
         self.converter_var = tk.StringVar(value=str(self.converter_path) if self.converter_path else "builtin")
         self.converter_entry = ttk.Entry(frame, textvariable=self.converter_var)
@@ -398,12 +388,12 @@ class W3DualSubtitleApp:
         self.converter_button.grid(row=2, column=2, sticky="ew")
         self.native_codec_button = ttk.Button(frame, text="Use built-in", command=self._use_native_codec)
         self.native_codec_button.grid(row=2, column=3, sticky="ew", padx=(6, 0))
-        self.converter_status_var = tk.StringVar(value="Compatibility has not been checked")
+        self.converter_status_var = tk.StringVar(value="Choose a game folder and language pair")
         ttk.Label(frame, textvariable=self.converter_status_var, wraplength=780).grid(
-            row=3, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+            row=3, column=0, columnspan=4, sticky="ew", pady=(0, 5))
 
         pair = ttk.Frame(frame)
-        pair.grid(row=4, column=0, columnspan=3, sticky="ew", pady=4)
+        pair.grid(row=4, column=0, columnspan=4, sticky="ew", pady=4)
         ttk.Label(pair, text="Primary language").pack(side="left")
         self.primary_var = tk.StringVar()
         self.primary_combo = ttk.Combobox(pair, textvariable=self.primary_var,
@@ -418,7 +408,7 @@ class W3DualSubtitleApp:
         self.secondary_combo.bind("<<ComboboxSelected>>", self._pair_changed)
 
         mode = ttk.Frame(frame)
-        mode.grid(row=5, column=0, columnspan=3, sticky="ew", pady=4)
+        mode.grid(row=5, column=0, columnspan=4, sticky="ew", pady=4)
         self.mode_var = tk.StringVar(value=MergeMode.DIALOGUE_ONLY.value)
         self.dialogue_mode = ttk.Radiobutton(
             mode, text="Dialogue-only merge", variable=self.mode_var,
@@ -435,7 +425,7 @@ class W3DualSubtitleApp:
             row=1, column=0, columnspan=2, sticky="ew")
 
         actions = ttk.Frame(frame)
-        actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(5, 7))
+        actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(5, 7))
         self.generate_button = ttk.Button(actions, text="Generate preview", command=self._generate_preview)
         self.generate_button.pack(side="left", padx=(0, 6))
         self.unmatched_button = ttk.Button(
@@ -451,14 +441,16 @@ class W3DualSubtitleApp:
         self.uninstall_button.pack(side="left", padx=6)
         self.rescan_button = ttk.Button(actions, text="Rescan", command=self._rescan_current)
         self.rescan_button.pack(side="right")
+        self.help_button = ttk.Button(frame, text="Help", command=lambda: show_help(self.root))
+        self.help_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
         ttk.Label(frame, text="Generation preview — target path and SHA-256").grid(
-            row=7, column=0, columnspan=3, sticky="w")
+            row=7, column=0, columnspan=4, sticky="w")
         preview_frame = ttk.Frame(frame)
-        preview_frame.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        preview_frame.grid(row=8, column=0, columnspan=4, sticky="nsew")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
-        self.preview = ttk.Treeview(preview_frame, columns=("hash",), show="headings", height=8)
+        self.preview = ttk.Treeview(preview_frame, columns=("hash",), show="headings", height=5)
         self.preview.heading("hash", text="Target resource — SHA-256")
         self.preview.column("hash", width=710, anchor="w")
         self.preview.grid(row=0, column=0, sticky="nsew")
@@ -466,19 +458,32 @@ class W3DualSubtitleApp:
         scroll.grid(row=0, column=1, sticky="ns")
         self.preview.configure(yscrollcommand=scroll.set)
         self.status_var = tk.StringVar(value="Ready")
-        self.operation_progress = ttk.Progressbar(frame, mode="indeterminate")
-        self.operation_progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        self.operation_progress = ttk.Progressbar(frame, mode="determinate")
+        self.operation_progress.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(7, 0))
         ttk.Label(frame, textvariable=self.status_var, wraplength=800).grid(
-            row=10, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+            row=10, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self.operation_progress.grid_remove()
+        hints = (
+            (self.game_combo, "Select a discovered installation; its language resources are rescanned."),
+            (self.browse_button, "Choose the game installation folder when discovery did not find it."),
+            (self.converter_entry, "The built-in codec is the default. Browse to choose an external converter."),
+            (self.converter_button, "Choose an external w3strings converter override; generation checks compatibility."),
+            (self.native_codec_button, "Return to the built-in codec; no external executable is needed."),
+            (self.primary_combo, "Choose the first language in merged text and the game language resources to replace."),
+            (self.secondary_combo, "Choose a different language to append to matching primary entries."),
+            (self.dialogue_mode, "Merge matching string IDs with no key hash in either language; keyed entries stay unchanged."),
+            (self.full_mode, "Merge all matching entries, including keyed text such as menus and descriptions."),
+            (self.generate_button, "Check semantic compatibility and create a preview before installing."),
+            (self.unmatched_button, "Open the preview's CSV list of identities that could not be matched."),
+            (self.install_button, "Review exact targets, back up originals, and install a fresh generated preview."),
+            (self.modify_button, "Apply a new preview to an active install while preserving original backups."),
+            (self.uninstall_button, "Review exact targets and restore the validated original backups."),
+            (self.rescan_button, "Refresh resource inventory, preview freshness, and managed install conflicts."),
+            (self.help_button, "Read the four-step workflow, merge modes, and backup/restore explanation."),
+        )
+        for widget, hint in hints:
+            attach_tooltip(widget, hint)
         self._set_controls_enabled(False)
-
-    def _sync_operation_progress(self):
-        if self._busy and not self._progress_running:
-            self.operation_progress.start()
-            self._progress_running = True
-        elif not self._busy and self._progress_running:
-            self.operation_progress.stop()
-            self._progress_running = False
 
     def _on_close(self):
         if self._busy:
@@ -493,7 +498,6 @@ class W3DualSubtitleApp:
         if self._busy:
             return
         self._busy = True
-        self._sync_operation_progress()
         self.status_var.set(f"{label.capitalize()}…")
         self._set_controls_enabled(False)
         self._refresh_action_buttons()
@@ -509,34 +513,41 @@ class W3DualSubtitleApp:
                     counts = (f" {update.completed}/{update.total}"
                               if update.total is not None else "")
                     self.status_var.set(update.phase + counts)
+                    if update.total is not None and update.total > 0:
+                        self.operation_progress.configure(
+                            maximum=update.total, value=update.completed,
+                        )
+                        self.operation_progress.grid()
+                    else:
+                        self.operation_progress.configure(value=0, maximum=1)
+                        self.operation_progress.grid_remove()
                     continue
                 self._busy = False
-                if error is not None:
-                    details = [str(error)]
-                    target_paths = getattr(error, "target_paths", ())
-                    rollback_errors = getattr(error, "rollback_errors", ())
-                    backup = getattr(error, "backup_directory", None)
-                    if target_paths:
-                        details.append("Affected files: " + ", ".join(target_paths))
-                    if backup:
-                        details.append(f"Original backups: {backup}")
-                    if rollback_errors:
-                        details.append("Rollback diagnostics: " + "; ".join(rollback_errors))
-                    self.status_var.set(f"{label.capitalize()} failed: " + " | ".join(details))
-                    if label == "converter compatibility check":
-                        self.converter_compatible = False
-                        self.converter_status_var.set(
-                            "Unavailable: " + summarize_compatibility_error(str(error))
-                        )
-                else:
-                    result, callback = payload
-                    callback(result)
-                self._sync_operation_progress()
-                self._set_controls_enabled(not self._busy)
-                self._refresh_action_buttons()
+                self.operation_progress.configure(value=0, maximum=1)
+                self.operation_progress.grid_remove()
+                try:
+                    if error is not None:
+                        details = [str(error)]
+                        target_paths = getattr(error, "target_paths", ())
+                        rollback_errors = getattr(error, "rollback_errors", ())
+                        backup = getattr(error, "backup_directory", None)
+                        if target_paths:
+                            details.append("Affected files: " + ", ".join(target_paths))
+                        if backup:
+                            details.append(f"Original backups: {backup}")
+                        if rollback_errors:
+                            details.append("Rollback diagnostics: " + "; ".join(rollback_errors))
+                        self.status_var.set(f"{label.capitalize()} failed: " + " | ".join(details))
+                    else:
+                        result, callback = payload
+                        callback(result)
+                finally:
+                    self._set_controls_enabled(not self._busy)
+                    self._refresh_action_buttons()
         except queue.Empty:
             pass
-        self.root.after(75, self._poll_messages)
+        finally:
+            self.root.after(75, self._poll_messages)
 
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -559,12 +570,13 @@ class W3DualSubtitleApp:
             )
 
     def _startup_scan(self, progress_callback: ProgressCallback):
+        report_progress(progress_callback, "Discovering storefront installations", 0, None)
         candidates = storefronts.discover_candidates()
         rows = ordered_startup_games(candidates, self.app_config.last_game_root,
-                                     logger=self.logger)
+                                     progress_callback=progress_callback, logger=self.logger)
         if not rows:
             return rows, None
-        return rows, self._load_game_snapshot(rows[0])
+        return rows, self._load_game_snapshot(rows[0], progress_callback)
 
     def _startup_loaded(self, result):
         rows, snapshot = result
@@ -577,7 +589,6 @@ class W3DualSubtitleApp:
             self.status_var.set("No installation found; manual folder selection is available")
             return
         self._apply_snapshot(snapshot)
-        self._run_compatibility_check()
 
     def _set_candidate_values(self):
         self._allow_game_value_event = True
@@ -589,11 +600,14 @@ class W3DualSubtitleApp:
             self.game_var.set(values[0])
         self._allow_game_value_event = False
 
-    def _load_game_snapshot(self, selected: ScannedGame) -> GameSnapshot:
+    def _load_game_snapshot(self, selected: ScannedGame,
+                            progress_callback: ProgressCallback | None = None) -> GameSnapshot:
         game = selected.game
         state_root = config.state_root_for(game.root)
         manifest = install.load_install_manifest(state_root, game.root)
-        comparison = install.compare_install(manifest, game) if manifest else None
+        comparison = install.compare_install(
+            manifest, game, progress_callback=progress_callback,
+        ) if manifest else None
         record = generation.load_latest_generation_record(self.app_root, game.root)
         freshness = None
         if record is not None:
@@ -601,7 +615,9 @@ class W3DualSubtitleApp:
                 overrides = source_overrides_for_pair(
                     game, manifest, record.primary_language, record.secondary_language,
                 )
-                freshness = generation.compare_generation(record, game, overrides or None)
+                freshness = generation.compare_generation(
+                    record, game, overrides or None, progress_callback=progress_callback,
+                )
             except Exception:
                 freshness = Freshness.STALE
         return GameSnapshot(selected, manifest, comparison, record, freshness)
@@ -635,7 +651,7 @@ class W3DualSubtitleApp:
         self.dialogue_mode.configure(state="normal")
         self._render_generation_and_install()
         self._set_candidate_values()
-        self._refresh_action_buttons()
+        self._check_readiness()
 
     def _render_generation_and_install(self):
         for item in self.preview.get_children():
@@ -706,9 +722,10 @@ class W3DualSubtitleApp:
     def _rescan_to_candidate(self, selected: ScannedGame):
         def operation(progress_callback: ProgressCallback):
             candidate = storefronts.refresh_candidate(selected.candidate)
+            report_progress(progress_callback, "Enumerating game resources", 0, None)
             game = scan_selected_folder(candidate.root, candidate=candidate)
             refreshed = ScannedGame(candidate, game)
-            return refreshed, self._load_game_snapshot(refreshed)
+            return refreshed, self._load_game_snapshot(refreshed, progress_callback)
 
         self._submit("rescan selected folder", operation, self._selection_loaded)
 
@@ -718,8 +735,6 @@ class W3DualSubtitleApp:
                 if _path_identity(row.game.root) != _path_identity(selected.game.root)]
         self._candidate_rows = (selected, *rows)
         self._apply_snapshot(snapshot)
-        self.converter_compatible = False
-        self._run_compatibility_check()
 
     def _browse_game(self):
         chosen = filedialog.askdirectory(title="Select The Witcher 3 game folder")
@@ -728,9 +743,10 @@ class W3DualSubtitleApp:
         candidate = GameCandidate(Path(chosen), Storefront.UNKNOWN, "manual selection")
 
         def operation(progress_callback: ProgressCallback):
+            report_progress(progress_callback, "Enumerating game resources", 0, None)
             game = scan_selected_folder(candidate.root, candidate=candidate)
             selected = ScannedGame(candidate, game)
-            return selected, self._load_game_snapshot(selected)
+            return selected, self._load_game_snapshot(selected, progress_callback)
 
         self._submit("scan selected folder", operation,
                      lambda result: self._selection_loaded(result))
@@ -747,8 +763,7 @@ class W3DualSubtitleApp:
         game_root = self.snapshot.selected.game.root if self.snapshot else self.app_config.last_game_root
         self.app_config = AppConfig(game_root, self.converter_path)
         config.save_config(self.app_config)
-        self.converter_compatible = False
-        self._run_compatibility_check()
+        self._check_readiness()
 
     def _use_native_codec(self):
         self.converter_path = None
@@ -756,8 +771,7 @@ class W3DualSubtitleApp:
         game_root = self.snapshot.selected.game.root if self.snapshot else self.app_config.last_game_root
         self.app_config = AppConfig(game_root, None)
         config.save_config(self.app_config)
-        self.converter_compatible = False
-        self._run_compatibility_check()
+        self._check_readiness()
 
     def _pair_changed(self, _event=None):
         if self._busy:
@@ -769,58 +783,34 @@ class W3DualSubtitleApp:
                 languages, self.primary_var.get(), self.secondary_var.get(),
             )
             self.secondary_var.set(secondary)
-        self.converter_compatible = False
-        self._refresh_action_buttons()
-        self._run_compatibility_check()
+        self._check_readiness()
 
     def _mode_changed(self):
         self._refresh_action_buttons()
 
-    def _run_compatibility_check(self):
-        if not self.snapshot or not self.primary_var.get() or not self.secondary_var.get():
-            self.converter_status_var.set("Choose two available, different languages")
-            return
-        game = self.snapshot.selected.game
-        primary, secondary = self.primary_var.get(), self.secondary_var.get()
-        if primary.casefold() == secondary.casefold():
-            self.converter_status_var.set("Primary and secondary languages must differ")
-            return
-        manifest = self.snapshot.manifest
-        converter_raw = self.converter_var.get().strip()
-
-        def operation(progress_callback: ProgressCallback):
-            converter = selected_converter(converter_raw)
-            overrides = source_overrides_for_pair(game, manifest, primary, secondary)
-            return check_pair_compatibility(game, primary, secondary, converter,
-                                            self.app_root, overrides or None)
-
-        self.converter_status_var.set("Checking selected resource copies with the selected codec…")
-        self._submit("converter compatibility check", operation, self._compatibility_checked)
-
-    def _compatibility_checked(self, report: CompatibilityReport):
-        self.converter_compatible = report.compatible
-        if report.compatible:
-            self.converter_status_var.set(
-                f"Compatible: {report.checked_resources} selected resources passed semantic round-trip — "
-                f"{self.converter_var.get()}"
-            )
+    def _check_readiness(self):
+        """Check paths and pairing only; generation owns semantic validation."""
+        raw = self.converter_var.get().strip()
+        self.codec_available = (raw in ("", "builtin") or Path(raw).expanduser().is_file())
+        if not self.codec_available:
+            self.converter_status_var.set("Selected external converter is missing; Browse or Use built-in")
+        elif not self._resources_pairable():
+            self.converter_status_var.set("Choose two different languages with existing, pairable resources")
         else:
-            detail = report.error or "converter failed compatibility check"
             self.converter_status_var.set(
-                "Unavailable: " + summarize_compatibility_error(detail)
+                "Ready: semantic compatibility will be checked during preview generation"
             )
-            self.logger.warning("Converter compatibility failed for %s: %s",
-                                self.converter_var.get(), detail)
         self._refresh_action_buttons()
 
     def _resources_pairable(self):
         if not self.snapshot:
             return False
         try:
-            generation._pair_resources(
-                self.snapshot.selected.game, self.primary_var.get(), self.secondary_var.get(),
-            )
-            return True
+            primary, secondary = self.primary_var.get(), self.secondary_var.get()
+            if not primary or not secondary or primary.casefold() == secondary.casefold():
+                return False
+            sources = generation._source_paths(self.snapshot.selected.game, primary, secondary, None)
+            return all(path.is_file() for path in sources.values())
         except Exception:
             return False
 
@@ -837,17 +827,17 @@ class W3DualSubtitleApp:
         )
         if active and snapshot and snapshot.manifest and record:
             pair_matches = pair_matches and record.generation_id != snapshot.manifest.generation_id
+        pairable = self._resources_pairable()
         actions = build_action_state(
             has_game=snapshot is not None,
             primary=self.primary_var.get(), secondary=self.secondary_var.get(),
-            mode=MergeMode(self.mode_var.get()), resources_available=self._resources_pairable(),
-            converter_compatible=self.converter_compatible,
+            mode=MergeMode(self.mode_var.get()), resources_available=pairable,
+            codec_available=self.codec_available,
             generated=bool(record and pair_matches),
             generation_freshness=snapshot.generation_freshness if snapshot else None,
             install_active=active, install_comparison=comparison,
             conflict_paths=conflicts,
         )
-        pairable = self._resources_pairable()
         self.full_mode.configure(state="normal" if pairable and not self._busy else "disabled")
         self.dialogue_mode.configure(
             state="normal" if pairable and snapshot and not self._busy else "disabled"
@@ -867,6 +857,7 @@ class W3DualSubtitleApp:
             raise RuntimeError("Select a game folder first")
         selected = self.snapshot.selected
         candidate = storefronts.refresh_candidate(selected.candidate)
+        report_progress(progress_callback, "Enumerating game resources", 0, None)
         game = scan_game(candidate.root, candidate.storefront, candidate.store_build_id)
         state = config.state_root_for(game.root)
         manifest = install.load_install_manifest(state, game.root)
@@ -972,7 +963,7 @@ class W3DualSubtitleApp:
                 game, record, state, progress_callback=progress_callback,
             )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
-            return result, self._load_game_snapshot(refreshed), tuple(record.output_files)
+            return result, self._load_game_snapshot(refreshed, progress_callback), tuple(record.output_files)
 
         root = self.snapshot.selected.game.root
         targets = tuple(str(root.joinpath(*Path(path).parts)) for path in record.output_files)
@@ -1012,7 +1003,7 @@ class W3DualSubtitleApp:
             )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
             completed = tuple(set(record.output_files) | set(manifest.target_files))
-            return result, self._load_game_snapshot(refreshed), completed
+            return result, self._load_game_snapshot(refreshed, progress_callback), completed
 
         root = self.snapshot.selected.game.root
         relative_targets = set(record.output_files)
@@ -1054,7 +1045,7 @@ class W3DualSubtitleApp:
                     backup_directory=result.backup_directory,
                 )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
-            return result, self._load_game_snapshot(refreshed), result.restored_paths
+            return result, self._load_game_snapshot(refreshed, progress_callback), result.restored_paths
 
         manifest = reviewed_manifest
         root = self.snapshot.selected.game.root
