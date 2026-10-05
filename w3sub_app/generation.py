@@ -31,7 +31,7 @@ from .models import (
 )
 
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 GENERATION_RECORD_SCHEMA = 1
 
 

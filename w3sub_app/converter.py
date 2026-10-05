@@ -115,7 +115,8 @@ class W3StringsConverter:
             if operation == "--encode":
                 arguments.append("--force-ignore-id-space-check-i-know-what-i-am-doing")
             result = subprocess.run(arguments, cwd=work_dir, capture_output=True,
-                                    text=True, check=False, shell=False)
+                                    text=True, check=False, shell=False,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, UnicodeError) as error:
             raise ConverterError(f"Cannot {operation} {source}: {error}") from error
         diagnostics = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"

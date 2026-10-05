@@ -54,6 +54,7 @@ def _running_game_processes() -> tuple[str, ...]:
             text=True,
             check=False,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise InstallError(f"Cannot confirm the game is closed: {error}") from error
