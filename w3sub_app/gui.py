@@ -861,7 +861,8 @@ class W3DualSubtitleApp:
             self.dialogue_mode.configure(state="disabled")
 
     def _fresh_game_and_manifest(self, allow_stale_install=False,
-                                 reviewed_manifest_signature=None):
+                                 reviewed_manifest_signature=None,
+                                 progress_callback: ProgressCallback | None = None):
         if not self.snapshot:
             raise RuntimeError("Select a game folder first")
         selected = self.snapshot.selected
@@ -871,7 +872,9 @@ class W3DualSubtitleApp:
         manifest = install.load_install_manifest(state, game.root)
         if reviewed_manifest_signature is not None:
             manifest = require_reviewed_manifest(reviewed_manifest_signature, manifest)
-        comparison = install.compare_install(manifest, game) if manifest else None
+        comparison = install.compare_install(
+            manifest, game, progress_callback=progress_callback,
+        ) if manifest else None
         if manifest and manifest.active:
             if comparison and comparison.conflict_paths:
                 raise install.InstallError(
@@ -895,7 +898,9 @@ class W3DualSubtitleApp:
         converter_raw = self.converter_var.get().strip()
 
         def operation(progress_callback: ProgressCallback):
-            game, _state, manifest, _comparison = self._fresh_game_and_manifest()
+            game, _state, manifest, _comparison = self._fresh_game_and_manifest(
+                progress_callback=progress_callback,
+            )
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             converter = selected_converter(converter_raw)
             record = generation.generate(
@@ -953,13 +958,19 @@ class W3DualSubtitleApp:
         record = self.snapshot.generation_record
 
         def operation(progress_callback: ProgressCallback):
-            game, state, manifest, _comparison = self._fresh_game_and_manifest()
+            game, state, manifest, _comparison = self._fresh_game_and_manifest(
+                progress_callback=progress_callback,
+            )
             if manifest and manifest.active:
                 raise install.InstallError("An install is already active; use Modify or Uninstall")
-            freshness = generation.compare_generation(record, game)
+            freshness = generation.compare_generation(
+                record, game, progress_callback=progress_callback,
+            )
             if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
                 raise install.InstallError(f"Preview is {freshness.value}; regenerate before install")
-            result = install.install_generation(game, record, state)
+            result = install.install_generation(
+                game, record, state, progress_callback=progress_callback,
+            )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
             return result, self._load_game_snapshot(refreshed), tuple(record.output_files)
 
@@ -984,16 +995,21 @@ class W3DualSubtitleApp:
         def operation(progress_callback: ProgressCallback):
             game, _state, manifest, _comparison = self._fresh_game_and_manifest(
                 reviewed_manifest_signature=reviewed_signature,
+                progress_callback=progress_callback,
             )
             if manifest is None or not manifest.active:
                 raise install.InstallError("There is no active install to modify")
             overrides = source_overrides_for_pair(
                 game, manifest, record.primary_language, record.secondary_language,
             )
-            freshness = generation.compare_generation(record, game, overrides or None)
+            freshness = generation.compare_generation(
+                record, game, overrides or None, progress_callback=progress_callback,
+            )
             if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
                 raise install.InstallError(f"Preview is {freshness.value}; regenerate before Modify")
-            result = install.modify_install(game, record, manifest)
+            result = install.modify_install(
+                game, record, manifest, progress_callback=progress_callback,
+            )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
             completed = tuple(set(record.output_files) | set(manifest.target_files))
             return result, self._load_game_snapshot(refreshed), completed
@@ -1019,6 +1035,7 @@ class W3DualSubtitleApp:
             game, _state, manifest, comparison = self._fresh_game_and_manifest(
                 allow_stale_install=True,
                 reviewed_manifest_signature=reviewed_signature,
+                progress_callback=progress_callback,
             )
             if manifest is None or not manifest.active:
                 raise install.InstallError("There is no active install to uninstall")
@@ -1029,7 +1046,7 @@ class W3DualSubtitleApp:
                     target_paths=comparison.conflict_paths,
                     backup_directory=manifest.backup_directory,
                 )
-            result = install.uninstall(game, manifest)
+            result = install.uninstall(game, manifest, progress_callback=progress_callback)
             if result.conflicts or result.error:
                 raise install.InstallError(
                     result.error or "Uninstall stopped because managed files conflict",
