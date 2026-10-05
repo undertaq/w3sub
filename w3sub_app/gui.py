@@ -527,7 +527,10 @@ class W3DualSubtitleApp:
                 self.operation_progress.grid_remove()
                 try:
                     if error is not None:
-                        details = [str(error)]
+                        error_text = str(error)
+                        details = [summarize_compatibility_error(error_text)
+                                   if "compatibility check failed:" in error_text.casefold()
+                                   else error_text]
                         target_paths = getattr(error, "target_paths", ())
                         rollback_errors = getattr(error, "rollback_errors", ())
                         backup = getattr(error, "backup_directory", None)
@@ -540,6 +543,7 @@ class W3DualSubtitleApp:
                         self.status_var.set(f"{label.capitalize()} failed: " + " | ".join(details))
                     else:
                         result, callback = payload
+                        self.status_var.set(f"{label.capitalize()} completed.")
                         callback(result)
                 finally:
                     self._set_controls_enabled(not self._busy)

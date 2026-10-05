@@ -585,6 +585,7 @@ def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation
                                 overrides: dict[str, Path] | None = None, *,
                                 progress_callback: ProgressCallback | None = None) -> None:
     """Called under the operation lock after staging, before any game replacement."""
+    report_progress(progress_callback, "Rechecking game before replacement", 0, None)
     _ensure_game_closed()
     try:
         current = _rescan_game(game)
@@ -609,11 +610,14 @@ def _require_generation_baselines(targets: dict[str, InstallTarget], record: Gen
                                target_paths=(relative,), backup_directory=backup_directory)
 
 
-def _verified_outputs(record: GenerationRecord, game: GameInstallation) -> dict[str, Path]:
-    if not generation._verify_outputs(record, game.root):
+def _verified_outputs(record: GenerationRecord, game: GameInstallation, *,
+                      progress_callback: ProgressCallback | None = None) -> dict[str, Path]:
+    if not generation._verify_outputs(record, game.root, progress_callback=progress_callback):
         raise InstallError("Generation output inventory or hash is invalid")
     outputs = {}
-    for relative, raw in record.output_files.items():
+    if record.output_files:
+        report_progress(progress_callback, "Validating generated transaction sources", 0, len(record.output_files))
+    for number, (relative, raw) in enumerate(record.output_files.items(), 1):
         _safe_relative(relative)
         target = _target_path(game.root, relative)
         source = Path(raw)
@@ -622,6 +626,7 @@ def _verified_outputs(record: GenerationRecord, game: GameInstallation) -> dict[
         if _hash_file(source) != record.output_hashes[relative]:
             raise InstallError(f"Generated output changed after generation: {relative}")
         outputs[relative] = source
+        report_progress(progress_callback, "Validating generated transaction sources", number, len(record.output_files))
     return outputs
 
 
@@ -675,10 +680,11 @@ def _restore_manifest(previous: InstallManifest | None, prepared: InstallManifes
 
 
 def _report_rollback_progress(callback: ProgressCallback | None, operation_name: str,
-                              completed: int, total: int) -> None:
+                              completed: int, total: int, *,
+                              phase: str = "restoring rollback targets") -> None:
     """An observer failure must not interrupt restoration or mask its diagnostics."""
     try:
-        report_progress(callback, f"{operation_name}: restoring rollback targets", completed, total)
+        report_progress(callback, f"{operation_name}: {phase}", completed, total)
     except Exception:
         pass
 
@@ -702,6 +708,8 @@ def _apply_transaction(game: GameInstallation,
     targets = {relative: _target_path(root, relative) for relative in sorted(desired_sources)}
     replacement_phase = ("restoring originals" if operation_name == "Uninstall"
                          else "replacing targets")
+    if targets:
+        report_progress(progress_callback, f"{operation_name}: validating transaction files", 0, len(targets))
     for number, (relative, path) in enumerate(targets.items(), 1):
         if _hash_file(path) != expected_current[relative]:
             raise InstallError(f"Game target changed before transaction: {relative}",
@@ -718,6 +726,8 @@ def _apply_transaction(game: GameInstallation,
     attempted: list[str] = []
     restore_stages: list[Path] = []
     try:
+        if targets:
+            report_progress(progress_callback, f"{operation_name}: snapshotting targets", 0, len(targets))
         transaction_directory.mkdir(parents=True, exist_ok=False)
         for number, (relative, target) in enumerate(targets.items(), 1):
             snapshot = transaction_directory.joinpath(*_safe_relative(relative))
@@ -729,6 +739,8 @@ def _apply_transaction(game: GameInstallation,
             report_progress(progress_callback, f"{operation_name}: snapshotting targets",
                             number, len(targets))
 
+        if targets:
+            report_progress(progress_callback, f"{operation_name}: staging files", 0, len(targets))
         _atomic_write_manifest(prepared_manifest)
         for number, (relative, target) in enumerate(targets.items(), 1):
             stages[relative] = _sibling_stage(target, desired_sources[relative], "w3sub-stage")
@@ -741,6 +753,8 @@ def _apply_transaction(game: GameInstallation,
         if pre_mutation_check is not None:
             pre_mutation_check()
 
+        if targets:
+            report_progress(progress_callback, f"{operation_name}: {replacement_phase}", 0, len(targets))
         for number, (relative, target) in enumerate(targets.items(), 1):
             if _hash_file(target) != expected_current[relative]:
                 raise InstallError(f"Game target changed during transaction: {relative}",
@@ -758,11 +772,16 @@ def _apply_transaction(game: GameInstallation,
             report_progress(progress_callback, f"{operation_name}: {replacement_phase}",
                             number, len(targets))
 
-        for relative, target in targets.items():
+        if targets:
+            report_progress(progress_callback, f"{operation_name}: verifying installed targets", 0, len(targets))
+        for number, (relative, target) in enumerate(targets.items(), 1):
             if _hash_file(target) != desired_hashes[relative]:
                 raise InstallError(f"Installed target hash verification failed: {relative}",
                                    target_paths=(relative,), backup_directory=backup_directory)
+            report_progress(progress_callback, f"{operation_name}: verifying installed targets", number, len(targets))
+        report_progress(progress_callback, f"{operation_name}: saving install manifest", 0, 1)
         _atomic_write_manifest(final_manifest)
+        report_progress(progress_callback, f"{operation_name}: saving install manifest", 1, 1)
     except Exception as operation_error:
         rollback_errors = []
         restored = 0
@@ -789,6 +808,8 @@ def _apply_transaction(game: GameInstallation,
                 _report_rollback_progress(progress_callback, operation_name, restored, len(attempted))
             except Exception as rollback_error:
                 rollback_errors.append(f"{relative}: {rollback_error}")
+        _report_rollback_progress(progress_callback, operation_name, 0, 1,
+                                  phase="restoring transaction manifest")
         if rollback_errors:
             conflicted = replace(
                 prepared_manifest,
@@ -799,12 +820,16 @@ def _apply_transaction(game: GameInstallation,
             )
             try:
                 _atomic_write_manifest(conflicted)
+                _report_rollback_progress(progress_callback, operation_name, 1, 1,
+                                          phase="restoring transaction manifest")
             except Exception as manifest_error:
                 rollback_errors.append(f"install manifest: {manifest_error}")
         else:
             try:
                 _restore_manifest(previous_manifest, prepared_manifest,
                                   remove_manifest_on_rollback)
+                _report_rollback_progress(progress_callback, operation_name, 1, 1,
+                                          phase="restoring transaction manifest")
             except Exception as manifest_error:
                 rollback_errors.append(f"install manifest: {manifest_error}")
         paths = tuple(sorted(set(attempted)))
@@ -843,10 +868,12 @@ def install_generation(game: GameInstallation, generation_record: GenerationReco
         )
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation is {freshness.value}; regenerate before installing")
-        outputs = _verified_outputs(generation_record, game)
+        outputs = _verified_outputs(generation_record, game, progress_callback=progress_callback)
         install_id = uuid.uuid4().hex
         backup_directory = state / "backups" / install_id
         try:
+            if outputs:
+                report_progress(progress_callback, "Install: backing up originals", 0, len(outputs))
             backup_directory.mkdir(parents=True, exist_ok=False)
             targets = {}
             for number, relative in enumerate(sorted(outputs), 1):
@@ -890,6 +917,8 @@ def _active_conflicts(manifest: InstallManifest, game: GameInstallation, *,
     if not manifest.active:
         return ()
     conflicts = []
+    if manifest.target_files:
+        report_progress(progress_callback, "Checking managed targets and backups", 0, len(manifest.target_files))
     for number, (relative, target) in enumerate(sorted(manifest.target_files.items()), 1):
         try:
             path = _target_path(game.root, relative)
@@ -971,6 +1000,8 @@ def _copy_new_backups(manifest: InstallManifest, game: GameInstallation,
                       relative_paths: set[str], *,
                       progress_callback: ProgressCallback | None = None) -> dict[str, InstallTarget]:
     targets = dict(manifest.target_files)
+    if relative_paths:
+        report_progress(progress_callback, "Modify: preparing original backups", 0, len(relative_paths))
     for number, relative in enumerate(sorted(relative_paths), 1):
         if relative in targets:
             _validate_backup(manifest, relative, targets[relative])
@@ -1037,7 +1068,7 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         )
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation is {freshness.value}; regenerate before Modify")
-        outputs = _verified_outputs(generation_record, game)
+        outputs = _verified_outputs(generation_record, game, progress_callback=progress_callback)
         output_paths = set(outputs)
         old_paths = set(manifest.target_files)
         union = output_paths | old_paths
@@ -1062,7 +1093,9 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         desired_sources = dict(outputs)
         desired_hashes = dict(generation_record.output_hashes)
         expected = {}
-        for relative in sorted(union):
+        if union:
+            report_progress(progress_callback, "Modify: preparing replacement and restoration sources", 0, len(union))
+        for number, relative in enumerate(sorted(union), 1):
             previous = manifest.target_files.get(relative)
             if previous is not None:
                 expected[relative] = previous.installed_sha256
@@ -1072,6 +1105,7 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
                 original = _validate_backup(manifest, relative, previous)
                 desired_sources[relative] = original
                 desired_hashes[relative] = previous.original_sha256
+            report_progress(progress_callback, "Modify: preparing replacement and restoration sources", number, len(union))
         _apply_transaction(game, state, manifest.backup_directory,
                            prepared, final, manifest,
                            desired_sources, desired_hashes, expected,
@@ -1099,6 +1133,8 @@ def uninstall(game: GameInstallation, manifest: InstallManifest, *,
         sources = {}
         hashes = {}
         expected = {}
+        if manifest.target_files:
+            report_progress(progress_callback, "Uninstall: validating restore sources", 0, len(manifest.target_files))
         for number, (relative, target) in enumerate(sorted(manifest.target_files.items()), 1):
             sources[relative] = _validate_backup(manifest, relative, target)
             hashes[relative] = target.original_sha256

@@ -60,6 +60,7 @@ def check_compatibility(sources: dict[str, Path], converter,
     work_dir = Path(work_dir).expanduser().resolve()
     errors = []
     try:
+        report_progress(progress_callback, "Checking resource compatibility", 0, len(inventory))
         work_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="compatibility-", dir=work_dir) as probe_name:
             probe = Path(probe_name)

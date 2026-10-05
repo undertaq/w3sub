@@ -157,6 +157,8 @@ def _fingerprint_sources(sources: dict[str, Path],
                          phase: str = "Fingerprinting resources") -> ResourceFingerprint:
     entries = {}
     aggregate = hashlib.sha256()
+    if sources:
+        report_progress(progress_callback, phase, 0, len(sources))
     for number, (relative, path) in enumerate(sorted(sources.items()), start=1):
         digest = _hash_file(path)
         entries[relative] = digest
@@ -271,7 +273,9 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
     classifier_digest = None
     classifier_schema = None
 
+    report_progress(progress_callback, "Identifying codec implementation", 0, 1)
     converter_path, converter_digest = _hash_executable(converter)
+    report_progress(progress_callback, "Identifying codec implementation", 1, 1)
     converter_version = getattr(converter, "version", None)
     if converter_version is not None and not isinstance(converter_version, str):
         converter_version = str(converter_version)
@@ -297,11 +301,14 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
             scratch = Path(scratch_name)
             copied_sources = {}
+            if sources:
+                report_progress(progress_callback, "Copying generation inputs", 0, len(sources))
             for number, (relative, source) in enumerate(sorted(sources.items())):
                 copied = scratch / "inputs" / str(number) / Path(relative).name
                 copied.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, copied)
                 copied_sources[relative] = copied
+                report_progress(progress_callback, "Copying generation inputs", number + 1, len(sources))
             report = check_compatibility(
                 copied_sources, converter, scratch / "compatibility",
                 progress_callback=progress_callback,
@@ -310,6 +317,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
                 codec_label = "Native codec" if native else "External converter"
                 raise GenerationError(f"{codec_label} compatibility check failed: {report.error}")
             for number, (_resource_parent, primary_relative, secondary_relative) in enumerate(pairs):
+                report_progress(progress_callback, "Merging resource pairs", number, len(pairs))
                 primary_csv = converter.decode(copied_sources[primary_relative],
                                                scratch / f"{number}-primary")
                 secondary_csv = converter.decode(copied_sources[secondary_relative],
@@ -340,6 +348,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
                     raise GenerationError(f"Cannot merge {primary_relative}: {error}") from error
                 report_progress(progress_callback, "Merging resource pairs",
                                 number + 1, len(pairs))
+                report_progress(progress_callback, "Encoding output files", number, len(pairs))
                 encoded = converter.encode(merged_csv, scratch / f"{number}-encoded")
                 target = generation_dir.joinpath(*PurePosixPath(primary_relative).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -359,10 +368,13 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             raise GenerationError(f"Cannot recheck generation inputs: {error}") from error
         if final_fingerprint != initial_fingerprint:
             raise GenerationError("A language resource changed during generation; retry")
+        report_progress(progress_callback, "Rechecking codec implementation", 0, 1)
         current_converter_path, final_converter_digest = _hash_executable(converter)
         if current_converter_path != converter_path or final_converter_digest != converter_digest:
             raise GenerationError("Converter executable changed during generation; retry")
+        report_progress(progress_callback, "Rechecking codec implementation", 1, 1)
 
+        report_progress(progress_callback, "Publishing generation preview", 0, 1)
         unmatched_report = generation_dir / "unmatched_entries.csv"
         _write_unmatched_report(unmatched_report, unmatched_report_rows)
         record = GenerationRecord(
@@ -394,6 +406,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             encoding="utf-8",
         )
         os.replace(temporary_record, generation_dir / "generation.json")
+        report_progress(progress_callback, "Publishing generation preview", 1, 1)
         return record
     except GenerationError:
         raise
@@ -578,7 +591,8 @@ def _safe_relative_output(relative: str) -> tuple[str, ...] | None:
     return posix.parts
 
 
-def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
+def _verify_outputs(record: GenerationRecord, game_root: Path, *,
+                    progress_callback: ProgressCallback | None = None) -> bool:
     expected_outputs = {
         relative
         for relative in record.source_fingerprint.entries
@@ -592,7 +606,8 @@ def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
     generation_dir = _generation_directory(record, game_root)
     if generation_dir is None:
         return False
-    for relative, raw_path in record.output_files.items():
+    report_progress(progress_callback, "Checking generated output files", 0, len(record.output_files))
+    for number, (relative, raw_path) in enumerate(record.output_files.items(), 1):
         parts = _safe_relative_output(relative)
         if parts is None:
             return False
@@ -613,6 +628,7 @@ def _verify_outputs(record: GenerationRecord, game_root: Path) -> bool:
                 return False
         except OSError:
             return False
+        report_progress(progress_callback, "Checking generated output files", number, len(record.output_files))
     return True
 
 
@@ -634,17 +650,19 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
         return Freshness.STALE
     if current_fingerprint != record.source_fingerprint:
         return Freshness.STALE
-    if not _verify_outputs(record, game.root):
+    if not _verify_outputs(record, game.root, progress_callback=progress_callback):
         return Freshness.STALE
     if record.codec_kind == "native":
         if record.converter_version != NativeW3StringsCodec.version:
             return Freshness.STALE
         try:
+            report_progress(progress_callback, "Checking codec implementation", 0, 1)
             _, current_codec_digest = _hash_executable(NativeW3StringsCodec())
         except GenerationError:
             return Freshness.UNREADABLE
         if record.converter_sha256 != current_codec_digest:
             return Freshness.STALE
+        report_progress(progress_callback, "Checking codec implementation", 1, 1)
     if game.storefront is not record.storefront:
         return Freshness.STALE
 
