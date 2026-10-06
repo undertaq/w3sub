@@ -138,7 +138,9 @@ def _progress_status(update: ProgressUpdate) -> str:
     return f"{phase}: {update.completed:,} / {update.total:,}"
 
 
-def _path_identity(path: Path) -> str:
+def _path_identity(path: Path | str | None) -> str | None:
+    if path is None:
+        return None
     try:
         resolved = Path(path).expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
