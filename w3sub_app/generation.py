@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import tempfile
 import uuid
 import shutil
+from dataclasses import asdict
 
 from .merge import (
     MergeError,
@@ -17,9 +18,13 @@ from .merge import (
     unmatched_native_entries,
 )
 from .converter import check_compatibility
+from .cutscene_generation import (
+    build_cutscene_overrides, fingerprint_cutscene_bundles, safe_relative_path,
+)
 from .progress import ProgressCallback, report_progress
 from .w3strings_native import NativeW3StringsCodec
 from .models import (
+    CutsceneGenerationSummary,
     Freshness,
     GameInstallation,
     GameVersion,
@@ -32,7 +37,7 @@ from .models import (
 
 
 APP_VERSION = "0.1.2"
-GENERATION_RECORD_SCHEMA = 1
+GENERATION_RECORD_SCHEMA = 2
 
 
 class GenerationError(RuntimeError):
@@ -195,7 +200,10 @@ def _fingerprint_payload(fingerprint: ResourceFingerprint) -> dict[str, object]:
     return {"entries": dict(sorted(fingerprint.entries.items())), "digest": fingerprint.digest}
 
 
-def _write_unmatched_report(path: Path, rows: list[tuple[str, ...]]) -> None:
+def _write_unmatched_report(path: Path, rows, *,
+                            columns: tuple[str, ...] = (
+                                "resource", "language", "side", "string_id",
+                                "key_hash_hex", "text", "reason")) -> None:
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -203,8 +211,7 @@ def _write_unmatched_report(path: Path, rows: list[tuple[str, ...]]) -> None:
                 suffix=".tmp", dir=path.parent, delete=False) as handle:
             temporary = Path(handle.name)
             writer = csv.writer(handle)
-            writer.writerow(("resource", "language", "side", "string_id",
-                             "key_hash_hex", "text", "reason"))
+            writer.writerow(columns)
             writer.writerows(rows)
             handle.flush()
             os.fsync(handle.fileno())
@@ -242,6 +249,13 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "total_entries": record.total_entries,
         "merged_entries": record.merged_entries,
         "unmatched_entries_count": record.unmatched_entries_count,
+        "include_cutscenes": record.include_cutscenes,
+        "cutscene_output_files": dict(sorted(record.cutscene_output_files.items())),
+        "cutscene_output_hashes": dict(sorted(record.cutscene_output_hashes.items())),
+        "cutscene_summary": asdict(record.cutscene_summary),
+        "cutscene_bundle_fingerprint": (
+            _fingerprint_payload(record.cutscene_bundle_fingerprint)
+            if record.cutscene_bundle_fingerprint is not None else None),
     }
 
 
@@ -253,6 +267,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
     native = isinstance(converter, NativeW3StringsCodec)
     if not isinstance(request.mode, MergeMode):
         raise GenerationError(f"Unsupported merge mode: {request.mode!r}")
+    if type(request.include_cutscenes) is not bool:
+        raise GenerationError("The cutscene option must be a boolean")
     if (not isinstance(request.primary_language, str)
             or not isinstance(request.secondary_language, str)):
         raise GenerationError("Language selections must be language codes")
@@ -296,8 +312,11 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
     output_hashes = {}
     merge_stats = MergeStats()
     unmatched_report_rows = []
+    published = False
 
     try:
+        initial_bundle_fingerprint = (fingerprint_cutscene_bundles(request.game)
+                                      if request.include_cutscenes else None)
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
             scratch = Path(scratch_name)
             copied_sources = {}
@@ -360,6 +379,15 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
                 report_progress(progress_callback, "Encoding output files",
                                 number + 1, len(pairs))
 
+        cutscenes = None
+        if request.include_cutscenes:
+            cutscenes = build_cutscene_overrides(
+                request.game, generation_dir / "cutscenes", primary_language,
+                secondary_language, progress_callback=progress_callback,
+            )
+            if cutscenes.bundle_fingerprint != initial_bundle_fingerprint:
+                raise GenerationError("Source bundles changed during generation; retry")
+
         try:
             final_fingerprint = _fingerprint_sources(
                 sources, progress_callback, "Rechecking generation inputs",
@@ -373,10 +401,20 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
         if current_converter_path != converter_path or final_converter_digest != converter_digest:
             raise GenerationError("Converter executable changed during generation; retry")
         report_progress(progress_callback, "Rechecking codec implementation", 1, 1)
+        if request.include_cutscenes:
+            report_progress(progress_callback, "Rechecking cutscene bundle metadata", 0, 1)
+            if fingerprint_cutscene_bundles(request.game) != initial_bundle_fingerprint:
+                raise GenerationError("Source bundles changed during generation; retry")
+            report_progress(progress_callback, "Rechecking cutscene bundle metadata", 1, 1)
 
         report_progress(progress_callback, "Publishing generation preview", 0, 1)
         unmatched_report = generation_dir / "unmatched_entries.csv"
         _write_unmatched_report(unmatched_report, unmatched_report_rows)
+        _write_unmatched_report(
+            generation_dir / "cutscene_unmatched.csv",
+            cutscenes.unmatched_rows if cutscenes is not None else (),
+            columns=("resource", "locale", "start", "end", "text", "reason"),
+        )
         record = GenerationRecord(
             generation_id=generation_id,
             game_root=root,
@@ -399,6 +437,13 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             total_entries=merge_stats.total_entries,
             merged_entries=merge_stats.merged_entries,
             unmatched_entries_count=len(unmatched_report_rows),
+            include_cutscenes=request.include_cutscenes,
+            cutscene_output_files=(
+                {relative: str(path.resolve()) for relative, path in cutscenes.output_files.items()}
+                if cutscenes is not None else {}),
+            cutscene_output_hashes=cutscenes.output_hashes if cutscenes is not None else {},
+            cutscene_summary=cutscenes.summary if cutscenes is not None else CutsceneGenerationSummary(),
+            cutscene_bundle_fingerprint=initial_bundle_fingerprint,
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -406,17 +451,84 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             encoding="utf-8",
         )
         os.replace(temporary_record, generation_dir / "generation.json")
+        if cutscenes is not None:
+            summary = cutscenes.summary
+            report_progress(
+                progress_callback,
+                f"Cutscenes: {summary.sidecar_changed + summary.usm_changed} changed, "
+                f"{summary.sidecar_skipped + summary.usm_skipped} skipped, "
+                f"{summary.matched_cues}/{summary.primary_cues} primary cues matched, "
+                f"{summary.output_bytes} output bytes",
+                1, 1,
+            )
         report_progress(progress_callback, "Publishing generation preview", 1, 1)
+        published = True
         return record
     except GenerationError:
         raise
     except Exception as error:
         raise GenerationError(f"Generation failed: {error}") from error
+    finally:
+        # The UUID directory is created exclusively for this attempt. Keep it
+        # only once a complete record has been returned, including callbacks.
+        if not published:
+            if generation_dir.resolve() != generations_root / generation_id:
+                raise GenerationError("Failed generation directory moved; refusing unsafe cleanup")
+            shutil.rmtree(generation_dir)
 
 
 def _record_from_payload(payload: object) -> GenerationRecord:
-    if not isinstance(payload, dict) or payload.get("schema_version") != GENERATION_RECORD_SCHEMA:
+    if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] not in (1, GENERATION_RECORD_SCHEMA)):
         raise ValueError("unsupported generation record schema")
+    include_cutscenes = False
+    cutscene_files, cutscene_hashes = {}, {}
+    cutscene_summary = CutsceneGenerationSummary()
+    cutscene_fingerprint = None
+    if payload["schema_version"] == 2:
+        include_cutscenes = payload.get("include_cutscenes")
+        if type(include_cutscenes) is not bool:
+            raise ValueError("generation record cutscene option is malformed")
+        cutscene_files, cutscene_hashes = (
+            payload.get("cutscene_output_files"), payload.get("cutscene_output_hashes"))
+        if (not isinstance(cutscene_files, dict) or not isinstance(cutscene_hashes, dict)
+                or cutscene_files.keys() != cutscene_hashes.keys()
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       for mapping in (cutscene_files, cutscene_hashes)
+                       for key, value in mapping.items())
+                or any(not _is_sha256(value) for value in cutscene_hashes.values())):
+            raise ValueError("generation record cutscene outputs are malformed")
+        for path in cutscene_files:
+            if (safe_relative_path(path) != path
+                    or PurePosixPath(path).suffix not in (".subs", ".usm")):
+                raise ValueError("generation record cutscene virtual path is unsafe")
+        summary = payload.get("cutscene_summary")
+        if (not isinstance(summary, dict)
+                or set(summary) != set(CutsceneGenerationSummary.__dataclass_fields__)
+                or any(type(value) is not int or value < 0 for value in summary.values())
+                or summary["matched_cues"] > min(summary["primary_cues"], summary["secondary_cues"])
+                or summary["unmatched_count"] != (
+                    summary["primary_cues"] + summary["secondary_cues"] - 2 * summary["matched_cues"])
+                or any(summary[f"{kind}_discovered"] != sum(
+                    summary[f"{kind}_{outcome}"] for outcome in ("changed", "skipped", "unchanged"))
+                    for kind in ("sidecar", "usm"))):
+            raise ValueError("generation record cutscene summary is malformed")
+        cutscene_summary = CutsceneGenerationSummary(**summary)
+        raw_fingerprint = payload.get("cutscene_bundle_fingerprint")
+        if include_cutscenes:
+            if (not isinstance(raw_fingerprint, dict)
+                    or not _is_sha256(raw_fingerprint.get("digest"))
+                    or not isinstance(raw_fingerprint.get("entries"), dict)):
+                raise ValueError("generation record bundle fingerprint is malformed")
+            for path, digest in raw_fingerprint["entries"].items():
+                if (safe_relative_path(path) != path or not path.endswith(".bundle")
+                        or not _is_sha256(digest)):
+                    raise ValueError("generation record bundle identity is malformed")
+            cutscene_fingerprint = ResourceFingerprint(
+                dict(raw_fingerprint["entries"]), raw_fingerprint["digest"])
+        elif (cutscene_files or cutscene_hashes or raw_fingerprint is not None
+              or cutscene_summary != CutsceneGenerationSummary()):
+            raise ValueError("disabled cutscene generation contains cutscene data")
     if payload.get("codec_kind", "external") not in ("native", "external"):
         raise ValueError("unsupported generation codec kind")
     total_entries = payload.get("total_entries")
@@ -499,6 +611,11 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         total_entries=total_entries,
         merged_entries=merged_entries,
         unmatched_entries_count=unmatched_entries_count,
+        include_cutscenes=include_cutscenes,
+        cutscene_output_files=dict(cutscene_files),
+        cutscene_output_hashes=dict(cutscene_hashes),
+        cutscene_summary=cutscene_summary,
+        cutscene_bundle_fingerprint=cutscene_fingerprint,
     )
     return record
 
@@ -539,7 +656,7 @@ def load_latest_generation_record(state_root: Path, game_root: Path) -> Generati
             record = _record_from_payload(payload)
             if (_normalized_game_root(record.game_root) != root
                     or _generation_directory(record, root) != directory.resolve(strict=True)
-                    or not _verify_outputs(record, root)):
+                    or not _verify_outputs(record, root, verify_cutscene_hashes=False)):
                 continue
             candidates.append((record_path.stat().st_mtime_ns, record))
         except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -588,11 +705,22 @@ def _safe_relative_output(relative: str) -> tuple[str, ...] | None:
             or ".." in posix.parts or "." in posix.parts
             or posix.as_posix() != relative or "\\" in relative):
         return None
+    try:
+        safe_relative_path(relative)
+    except ValueError:
+        return None
     return posix.parts
 
 
 def _verify_outputs(record: GenerationRecord, game_root: Path, *,
-                    progress_callback: ProgressCallback | None = None) -> bool:
+                    progress_callback: ProgressCallback | None = None,
+                    verify_cutscene_hashes: bool = True) -> bool:
+    """Verify all paths and hashes; startup may omit large USM content reads.
+
+    Install callers use the default full verification. Even cheap freshness
+    checks validate every cutscene path, existence and total output size, and
+    hash the small sidecars alongside existing w3strings outputs.
+    """
     expected_outputs = {
         relative
         for relative in record.source_fingerprint.entries
@@ -606,30 +734,52 @@ def _verify_outputs(record: GenerationRecord, game_root: Path, *,
     generation_dir = _generation_directory(record, game_root)
     if generation_dir is None:
         return False
-    report_progress(progress_callback, "Checking generated output files", 0, len(record.output_files))
-    for number, (relative, raw_path) in enumerate(record.output_files.items(), 1):
-        parts = _safe_relative_output(relative)
-        if parts is None:
+    if (type(record.include_cutscenes) is not bool
+            or record.cutscene_output_files.keys() != record.cutscene_output_hashes.keys()):
+        return False
+    if record.include_cutscenes:
+        if record.cutscene_bundle_fingerprint is None:
             return False
-        expected = generation_dir.joinpath(*parts)
+    elif (record.cutscene_output_files or record.cutscene_output_hashes
+          or record.cutscene_bundle_fingerprint is not None
+          or record.cutscene_summary != CutsceneGenerationSummary()):
+        return False
+    total = len(record.output_files) + len(record.cutscene_output_files)
+    report_progress(progress_callback, "Checking generated output files", 0, total)
+    cutscene_bytes = 0
+    outputs = [(relative, raw_path, record.output_hashes.get(relative), False)
+               for relative, raw_path in record.output_files.items()]
+    outputs.extend((relative, raw_path, record.cutscene_output_hashes.get(relative), True)
+                   for relative, raw_path in record.cutscene_output_files.items())
+    for number, (relative, raw_path, digest, cutscene) in enumerate(outputs, 1):
+        parts = _safe_relative_output(relative)
+        if parts is None or not _is_sha256(digest):
+            return False
+        if cutscene and (safe_relative_path(relative) != relative
+                         or PurePosixPath(relative).suffix not in (".subs", ".usm")):
+            return False
+        expected = (generation_dir / "cutscenes" if cutscene else generation_dir).joinpath(*parts)
         try:
             actual_path = Path(raw_path)
             if not actual_path.is_absolute():
                 return False
             actual = actual_path.resolve(strict=True)
             expected = expected.resolve(strict=True)
-            if actual != expected:
+            if actual != expected or not actual.is_file():
                 return False
             try:
                 actual.relative_to(generation_dir)
             except ValueError:
                 return False
-            if _hash_file(expected) != record.output_hashes[relative]:
+            if cutscene:
+                cutscene_bytes += actual.stat().st_size
+            must_hash = not cutscene or verify_cutscene_hashes or actual.suffix.casefold() != ".usm"
+            if must_hash and _hash_file(expected) != digest:
                 return False
-        except OSError:
+        except (OSError, ValueError, TypeError, RuntimeError):
             return False
-        report_progress(progress_callback, "Checking generated output files", number, len(record.output_files))
-    return True
+        report_progress(progress_callback, "Checking generated output files", number, total)
+    return cutscene_bytes == record.cutscene_summary.output_bytes
 
 
 def compare_generation(record: GenerationRecord, game: GameInstallation,
@@ -640,17 +790,26 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
         return Freshness.STALE
     if record.app_version != APP_VERSION:
         return Freshness.STALE
+    if record.include_cutscenes and game.version != record.game_version:
+        return Freshness.STALE
     try:
         sources = _source_paths(game, record.primary_language,
                                  record.secondary_language, source_overrides)
         current_fingerprint = _fingerprint_sources(sources, progress_callback)
+        if record.include_cutscenes:
+            report_progress(progress_callback, "Checking cutscene bundle metadata", 0, 1)
+            current_bundles = fingerprint_cutscene_bundles(game)
+            if current_bundles != record.cutscene_bundle_fingerprint:
+                return Freshness.STALE
+            report_progress(progress_callback, "Checking cutscene bundle metadata", 1, 1)
     except (OSError, PermissionError):
         return Freshness.UNREADABLE
     except (GenerationError, ValueError):
         return Freshness.STALE
     if current_fingerprint != record.source_fingerprint:
         return Freshness.STALE
-    if not _verify_outputs(record, game.root, progress_callback=progress_callback):
+    if not _verify_outputs(record, game.root, progress_callback=progress_callback,
+                           verify_cutscene_hashes=False):
         return Freshness.STALE
     if record.codec_kind == "native":
         if record.converter_version != NativeW3StringsCodec.version:

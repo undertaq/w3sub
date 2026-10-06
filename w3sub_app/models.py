@@ -1,5 +1,5 @@
 """Shared discovery and game resource values."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -59,12 +59,39 @@ class GenerationRequest:
     secondary_language: str
     mode: MergeMode
     source_overrides: dict[str, Path] | None = None
+    include_cutscenes: bool = True
 
 
 @dataclass(frozen=True)
 class ResourceFingerprint:
     entries: dict[str, str]
     digest: str
+
+
+@dataclass(frozen=True)
+class CutsceneGenerationSummary:
+    # Sidecar resources are logical stems for the selected language pair,
+    # plus malformed paths reported as skips. Changed counts exclude aliases.
+    sidecar_discovered: int = 0
+    sidecar_changed: int = 0
+    sidecar_skipped: int = 0
+    sidecar_unchanged: int = 0
+    usm_discovered: int = 0
+    usm_changed: int = 0
+    usm_skipped: int = 0
+    usm_unchanged: int = 0
+    primary_cues: int = 0
+    secondary_cues: int = 0
+    matched_cues: int = 0
+    # Counts unmatched cues, excluding resource-level skip diagnostics in CSV.
+    unmatched_count: int = 0
+    output_bytes: int = 0
+    estimated_work_bytes: int = 0
+    estimated_output_bytes: int = 0
+
+    @property
+    def match_ratio(self) -> float:
+        return self.matched_cues / self.primary_cues if self.primary_cues else 0.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +117,11 @@ class GenerationRecord:
     total_entries: int | None = None
     merged_entries: int | None = None
     unmatched_entries_count: int | None = None
+    include_cutscenes: bool = False
+    cutscene_output_files: dict[str, str] = field(default_factory=dict)
+    cutscene_output_hashes: dict[str, str] = field(default_factory=dict)
+    cutscene_summary: CutsceneGenerationSummary = field(default_factory=CutsceneGenerationSummary)
+    cutscene_bundle_fingerprint: ResourceFingerprint | None = None
 
 
 @dataclass(frozen=True)
