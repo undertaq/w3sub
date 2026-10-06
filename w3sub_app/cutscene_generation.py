@@ -5,11 +5,13 @@ from dataclasses import dataclass
 import hashlib
 import io
 import os
+import struct
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import tempfile
 
 from .bundle_reader import (
-    BundleEntry, enumerate_witcher_bundles, iter_bundle_entries, write_bundle_entry,
+    BundleEntry, BundleReadError, enumerate_witcher_bundles, iter_bundle_entries, write_bundle_entry,
+    _HEADER_SIZE, _ENTRY_SIZE, _SIGNATURE, _read_exact,
 )
 from .cutscene_subs import merge_subs
 from .models import CutsceneGenerationSummary, GameInstallation, ResourceFingerprint
@@ -24,6 +26,7 @@ class CutsceneBuildResult:
     bundle_fingerprint: ResourceFingerprint
     summary: CutsceneGenerationSummary
     unmatched_rows: tuple[tuple[str, ...], ...]
+    bundle_content_fingerprint: ResourceFingerprint
 
 
 class CutsceneGenerationError(ValueError):
@@ -85,10 +88,132 @@ def fingerprint_cutscene_bundles(game: GameInstallation) -> ResourceFingerprint:
     return ResourceFingerprint(entries, aggregate.hexdigest())
 
 
-def _inventory(game: GameInstallation, fingerprint: ResourceFingerprint,
-               callback: ProgressCallback | None) -> tuple[BundleEntry, ...]:
+def _aggregate_fingerprint(entries: dict[str, str]) -> ResourceFingerprint:
+    aggregate = hashlib.sha256()
+    for relative, digest in sorted(entries.items()):
+        encoded = relative.encode("utf-8")
+        aggregate.update(len(encoded).to_bytes(8, "big"))
+        aggregate.update(encoded)
+        aggregate.update(bytes.fromhex(digest))
+    return ResourceFingerprint(entries, aggregate.hexdigest())
+
+
+def _bundle_file_identity(info) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _fingerprint_bundle_tables(
+    game: GameInstallation, metadata: ResourceFingerprint,
+    callback: ProgressCallback | None, phase: str,
+) -> tuple[ResourceFingerprint, tuple[str, ...], dict[str, tuple[int, ...]]]:
+    """Hash live v5 headers/tables and select full-content scope from their names."""
     root = Path(game.root).resolve(strict=True)
-    key = (str(root), game.version, fingerprint.digest)
+    plans = {}
+    total = 0
+    for relative in sorted(metadata.entries):
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        current = root
+        for part in PurePosixPath(relative).parts:
+            current = current / part
+            info = current.lstat()
+            if current.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise CutsceneGenerationError(f"Source bundle path is redirected: {relative}")
+        with path.open("rb") as source:
+            info = os.fstat(source.fileno())
+            header = _read_exact(source, _HEADER_SIZE, path, "bundle header")
+        declared = struct.unpack_from("<Q", header, 8)[0]
+        size = struct.unpack_from("<I", header, 16)[0]
+        version = struct.unpack_from("<H", header, 20)[0]
+        if (header[:8] != _SIGNATURE or version != 5 or declared != info.st_size
+                or size % _ENTRY_SIZE or _HEADER_SIZE + size > info.st_size):
+            raise BundleReadError(path, "invalid v5 header/table bounds during content fingerprinting")
+        plans[relative] = (path, header, size, _bundle_file_identity(info))
+        total += _HEADER_SIZE + size
+    entries = {}
+    relevant = []
+    identities = {}
+    completed = 0
+    report_progress(callback, phase, 0, total)
+    block_size = (1024 * 1024 // _ENTRY_SIZE) * _ENTRY_SIZE
+    for relative, (path, expected_header, size, identity) in plans.items():
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            if _bundle_file_identity(before) != identity:
+                raise CutsceneGenerationError(f"Source bundle changed before table hashing: {relative}")
+            header = _read_exact(source, _HEADER_SIZE, path, "bundle header")
+            if header != expected_header:
+                raise CutsceneGenerationError(f"Source bundle header changed while hashing: {relative}")
+            digest = hashlib.sha256(b"w3sub-table-v1\0" + header)
+            completed += len(header)
+            report_progress(callback, phase, completed, total)
+            remaining = size
+            has_cutscenes = False
+            while remaining:
+                block = _read_exact(source, min(remaining, block_size), path, "bundle metadata table")
+                digest.update(block)
+                for offset in range(0, len(block), _ENTRY_SIZE):
+                    name = block[offset:offset + 256].split(b"\0", 1)[0].lower()
+                    if name.endswith((b".subs", b".usm")):
+                        has_cutscenes = True
+                remaining -= len(block)
+                completed += len(block)
+                report_progress(callback, phase, completed, total)
+            after = os.fstat(source.fileno())
+        if identity != _bundle_file_identity(after) or identity != _bundle_file_identity(path.stat()):
+            raise CutsceneGenerationError(f"Source bundle changed while table hashing: {relative}")
+        entries[relative] = digest.hexdigest()
+        identities[relative] = identity
+        if has_cutscenes:
+            relevant.append(relative)
+    return _aggregate_fingerprint(entries), tuple(relevant), identities
+
+
+def fingerprint_cutscene_bundle_contents(
+    game: GameInstallation, *, progress_callback: ProgressCallback | None = None,
+    phase: str = "Hashing cutscene source bundles",
+) -> ResourceFingerprint:
+    """Hash all live header/tables and full bytes of candidate-containing bundles.
+
+    The per-bundle digest includes a table/content domain tag. Recomputing scope
+    from every table detects hidden new candidates even with unchanged size and
+    timestamps. Startup uses only the separate metadata fingerprint helper.
+    """
+    metadata = fingerprint_cutscene_bundles(game)
+    root = Path(game.root).resolve(strict=True)
+    tables, relevant, identities = _fingerprint_bundle_tables(
+        game, metadata, progress_callback, phase + ": metadata tables")
+    entries = dict(tables.entries)
+    total = sum(identities[relative][2] for relative in relevant)
+    completed = 0
+    report_progress(progress_callback, phase + ": relevant bundle contents", 0, total)
+    for relative in relevant:
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        digest = hashlib.sha256(b"w3sub-content-v1\0")
+        with path.open("rb") as source:
+            if _bundle_file_identity(os.fstat(source.fileno())) != identities[relative]:
+                raise CutsceneGenerationError(f"Source bundle changed before content hashing: {relative}")
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+                completed += len(block)
+                report_progress(progress_callback, phase + ": relevant bundle contents", completed, total)
+            after = os.fstat(source.fileno())
+        if (identities[relative] != _bundle_file_identity(after)
+                or identities[relative] != _bundle_file_identity(path.stat())):
+            raise CutsceneGenerationError(f"Source bundle changed while content hashing: {relative}")
+        entries[relative] = digest.hexdigest()
+    # Tables are small; repeat them after the potentially long relevant pass.
+    final_tables, final_relevant, _ = _fingerprint_bundle_tables(
+        game, metadata, progress_callback, phase + ": rechecking metadata tables")
+    if final_tables != tables or final_relevant != relevant or fingerprint_cutscene_bundles(game) != metadata:
+        raise CutsceneGenerationError("Source bundle inventory/tables changed while hashing; retry")
+    return _aggregate_fingerprint(entries)
+
+
+def _inventory(game: GameInstallation, fingerprint: ResourceFingerprint,
+               callback: ProgressCallback | None,
+               content_fingerprint: ResourceFingerprint) -> tuple[BundleEntry, ...]:
+    root = Path(game.root).resolve(strict=True)
+    key = (str(root), game.version, fingerprint.digest + content_fingerprint.digest)
     cached = _INVENTORY_CACHE.get(key)
     if cached is not None:
         report_progress(callback, "Using cached cutscene bundle inventory", len(cached), None)
@@ -151,6 +276,7 @@ def _sidecar_key(path: str) -> tuple[str, str] | None:
 def build_cutscene_overrides(
     game: GameInstallation, output_root: Path, primary_language: str, secondary_language: str,
     *, progress_callback: ProgressCallback | None = None,
+    bundle_content_fingerprint: ResourceFingerprint | None = None,
 ) -> CutsceneBuildResult:
     """Stage changed resources only; remove all created outputs on failure.
 
@@ -170,7 +296,12 @@ def build_cutscene_overrides(
         raise CutsceneGenerationError("Cutscene staging must be outside the game folder")
     root.mkdir(parents=True, exist_ok=True)
     fingerprint = fingerprint_cutscene_bundles(game)
-    inventory = _inventory(game, fingerprint, progress_callback)
+    content_fingerprint = (bundle_content_fingerprint
+                           if bundle_content_fingerprint is not None else
+                           fingerprint_cutscene_bundle_contents(game, progress_callback=progress_callback))
+    if content_fingerprint.entries.keys() != fingerprint.entries.keys():
+        raise CutsceneGenerationError("Source bundle inventory changed before cutscene generation; retry")
+    inventory = _inventory(game, fingerprint, progress_callback, content_fingerprint)
     rows: list[tuple[str, ...]] = []
     outputs: dict[str, Path] = {}
     hashes: dict[str, str] = {}
@@ -370,8 +501,11 @@ def build_cutscene_overrides(
         if fingerprint_cutscene_bundles(game) != fingerprint:
             raise CutsceneGenerationError("Source bundles changed during cutscene generation; retry")
         report_progress(progress_callback, "Rechecking cutscene bundle metadata", 1, 1)
+        if fingerprint_cutscene_bundle_contents(
+                game, progress_callback=progress_callback, phase="Rechecking cutscene bundle contents") != content_fingerprint:
+            raise CutsceneGenerationError("Source bundle contents changed during cutscene generation; retry")
         return CutsceneBuildResult(outputs, hashes, fingerprint,
-                                   CutsceneGenerationSummary(**counts), tuple(rows))
+                                   CutsceneGenerationSummary(**counts), tuple(rows), content_fingerprint)
     except BaseException:
         for target in outputs.values():
             target.unlink(missing_ok=True)

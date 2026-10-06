@@ -122,6 +122,7 @@ class GenerationRecord:
     cutscene_output_hashes: dict[str, str] = field(default_factory=dict)
     cutscene_summary: CutsceneGenerationSummary = field(default_factory=CutsceneGenerationSummary)
     cutscene_bundle_fingerprint: ResourceFingerprint | None = None
+    cutscene_bundle_content_fingerprint: ResourceFingerprint | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,7 @@ class InstallManifest:
     prepared: bool = False
     generation_provenance: GenerationProvenance | None = None
     cutscene_bundle_fingerprint: ResourceFingerprint | None = None
+    cutscene_bundle_content_fingerprint: ResourceFingerprint | None = None
     created_directories: tuple[str, ...] = ()
 
 

@@ -19,7 +19,8 @@ from .merge import (
 )
 from .converter import check_compatibility
 from .cutscene_generation import (
-    build_cutscene_overrides, fingerprint_cutscene_bundles, safe_relative_path,
+    build_cutscene_overrides, fingerprint_cutscene_bundles,
+    fingerprint_cutscene_bundle_contents, safe_relative_path,
 )
 from .progress import ProgressCallback, report_progress
 from .w3strings_native import NativeW3StringsCodec
@@ -253,6 +254,9 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "cutscene_output_files": dict(sorted(record.cutscene_output_files.items())),
         "cutscene_output_hashes": dict(sorted(record.cutscene_output_hashes.items())),
         "cutscene_summary": asdict(record.cutscene_summary),
+        "cutscene_bundle_content_fingerprint": (
+            _fingerprint_payload(record.cutscene_bundle_content_fingerprint)
+            if record.cutscene_bundle_content_fingerprint is not None else None),
         "cutscene_bundle_fingerprint": (
             _fingerprint_payload(record.cutscene_bundle_fingerprint)
             if record.cutscene_bundle_fingerprint is not None else None),
@@ -317,6 +321,8 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
     try:
         initial_bundle_fingerprint = (fingerprint_cutscene_bundles(request.game)
                                       if request.include_cutscenes else None)
+        initial_bundle_content = (fingerprint_cutscene_bundle_contents(
+            request.game, progress_callback=progress_callback) if request.include_cutscenes else None)
         with tempfile.TemporaryDirectory(prefix="convert-", dir=generations_root) as scratch_name:
             scratch = Path(scratch_name)
             copied_sources = {}
@@ -384,6 +390,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             cutscenes = build_cutscene_overrides(
                 request.game, generation_dir / "cutscenes", primary_language,
                 secondary_language, progress_callback=progress_callback,
+                bundle_content_fingerprint=initial_bundle_content,
             )
             if cutscenes.bundle_fingerprint != initial_bundle_fingerprint:
                 raise GenerationError("Source bundles changed during generation; retry")
@@ -444,6 +451,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             cutscene_output_hashes=cutscenes.output_hashes if cutscenes is not None else {},
             cutscene_summary=cutscenes.summary if cutscenes is not None else CutsceneGenerationSummary(),
             cutscene_bundle_fingerprint=initial_bundle_fingerprint,
+            cutscene_bundle_content_fingerprint=initial_bundle_content,
         )
         temporary_record = generation_dir / "generation.json.tmp"
         temporary_record.write_text(
@@ -485,6 +493,7 @@ def _record_from_payload(payload: object) -> GenerationRecord:
     cutscene_files, cutscene_hashes = {}, {}
     cutscene_summary = CutsceneGenerationSummary()
     cutscene_fingerprint = None
+    cutscene_content_fingerprint = None
     if payload["schema_version"] == 2:
         include_cutscenes = payload.get("include_cutscenes")
         if type(include_cutscenes) is not bool:
@@ -526,7 +535,16 @@ def _record_from_payload(payload: object) -> GenerationRecord:
                     raise ValueError("generation record bundle identity is malformed")
             cutscene_fingerprint = ResourceFingerprint(
                 dict(raw_fingerprint["entries"]), raw_fingerprint["digest"])
+            raw_content = payload.get("cutscene_bundle_content_fingerprint")
+            if raw_content is not None:
+                if (not isinstance(raw_content, dict) or not _is_sha256(raw_content.get("digest"))
+                        or not isinstance(raw_content.get("entries"), dict)
+                        or raw_content["entries"].keys() != cutscene_fingerprint.entries.keys()
+                        or any(not _is_sha256(digest) for digest in raw_content["entries"].values())):
+                    raise ValueError("generation record bundle content fingerprint is malformed")
+                cutscene_content_fingerprint = ResourceFingerprint(dict(raw_content["entries"]), raw_content["digest"])
         elif (cutscene_files or cutscene_hashes or raw_fingerprint is not None
+              or payload.get("cutscene_bundle_content_fingerprint") is not None
               or cutscene_summary != CutsceneGenerationSummary()):
             raise ValueError("disabled cutscene generation contains cutscene data")
     if payload.get("codec_kind", "external") not in ("native", "external"):
@@ -616,6 +634,7 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         cutscene_output_hashes=dict(cutscene_hashes),
         cutscene_summary=cutscene_summary,
         cutscene_bundle_fingerprint=cutscene_fingerprint,
+        cutscene_bundle_content_fingerprint=cutscene_content_fingerprint,
     )
     return record
 
@@ -738,10 +757,13 @@ def _verify_outputs(record: GenerationRecord, game_root: Path, *,
             or record.cutscene_output_files.keys() != record.cutscene_output_hashes.keys()):
         return False
     if record.include_cutscenes:
-        if record.cutscene_bundle_fingerprint is None:
+        if (record.cutscene_bundle_fingerprint is None
+                or record.cutscene_bundle_content_fingerprint is None
+                or record.cutscene_bundle_content_fingerprint.entries.keys() != record.cutscene_bundle_fingerprint.entries.keys()):
             return False
     elif (record.cutscene_output_files or record.cutscene_output_hashes
           or record.cutscene_bundle_fingerprint is not None
+          or record.cutscene_bundle_content_fingerprint is not None
           or record.cutscene_summary != CutsceneGenerationSummary()):
         return False
     total = len(record.output_files) + len(record.cutscene_output_files)

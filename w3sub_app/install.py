@@ -11,7 +11,7 @@ import stat
 import uuid
 
 from . import generation, storefronts
-from .cutscene_generation import fingerprint_cutscene_bundles
+from .cutscene_generation import fingerprint_cutscene_bundles, fingerprint_cutscene_bundle_contents
 from .game import scan_game
 from .progress import ProgressCallback, report_progress
 from .models import (
@@ -326,6 +326,9 @@ def _manifest_payload(manifest: InstallManifest) -> dict[str, object]:
         "conflict_paths": list(manifest.conflict_paths),
         "prepared": manifest.prepared,
         "created_directories": list(manifest.created_directories),
+        "cutscene_bundle_content_fingerprint": (
+            _fingerprint_payload(manifest.cutscene_bundle_content_fingerprint)
+            if manifest.cutscene_bundle_content_fingerprint is not None else None),
         "cutscene_bundle_fingerprint": (
             _fingerprint_payload(manifest.cutscene_bundle_fingerprint)
             if manifest.cutscene_bundle_fingerprint is not None else None),
@@ -370,6 +373,12 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
         if not isinstance(raw_cutscene, dict) or not isinstance(raw_cutscene.get("entries"), dict):
             raise ValueError("cutscene_bundle_fingerprint must contain an entries object")
         cutscene_fingerprint = ResourceFingerprint(dict(raw_cutscene["entries"]), raw_cutscene["digest"])
+    raw_content = payload.get("cutscene_bundle_content_fingerprint") if payload["schema_version"] == 2 else None
+    content_fingerprint = None
+    if raw_content is not None:
+        if not isinstance(raw_content, dict) or not isinstance(raw_content.get("entries"), dict):
+            raise ValueError("cutscene_bundle_content_fingerprint must contain an entries object")
+        content_fingerprint = ResourceFingerprint(dict(raw_content["entries"]), raw_content["digest"])
     targets = {}
     for relative, entry in payload["target_files"].items():
         if not isinstance(entry, dict) or entry.get("relative_path") != relative:
@@ -404,6 +413,7 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
         prepared=bool(payload.get("prepared", False)),
         generation_provenance=provenance,
         cutscene_bundle_fingerprint=cutscene_fingerprint,
+        cutscene_bundle_content_fingerprint=content_fingerprint,
         created_directories=tuple(payload.get("created_directories", ())) if payload["schema_version"] == 2 else (),
     )
 
@@ -471,6 +481,13 @@ def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
                 or any(generation._safe_relative_output(path) is None or not _is_digest(digest)
                        for path, digest in fingerprint.entries.items())):
             raise InstallError("Install cutscene bundle fingerprint is invalid")
+    content = manifest.cutscene_bundle_content_fingerprint
+    if content is not None:
+        if (fingerprint is None or not isinstance(content, ResourceFingerprint)
+                or not isinstance(content.entries, dict) or not _is_digest(content.digest)
+                or content.entries.keys() != fingerprint.entries.keys()
+                or any(not _is_digest(digest) for digest in content.entries.values())):
+            raise InstallError("Install cutscene bundle content fingerprint is invalid")
     folded = [relative.casefold() for relative in manifest.target_files]
     if len(folded) != len(set(folded)):
         raise InstallError("Install manifest contains aliased target paths")
@@ -746,6 +763,12 @@ def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation
         )
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation became {freshness.value} before mutation; regenerate")
+        if record.include_cutscenes:
+            if (record.cutscene_bundle_content_fingerprint is None or
+                    fingerprint_cutscene_bundle_contents(
+                        current, progress_callback=progress_callback, phase="Checking cutscene bundle content identity")
+                    != record.cutscene_bundle_content_fingerprint):
+                raise InstallError("Source bundle contents changed before mutation; regenerate")
         if not generation._verify_outputs(record, game.root, progress_callback=progress_callback):
             raise InstallError("Generated outputs changed immediately before mutation")
     except InstallError:
@@ -818,6 +841,7 @@ def _make_manifest(game: GameInstallation, record: GenerationRecord,
         prepared=prepared,
         generation_provenance=provenance,
         cutscene_bundle_fingerprint=record.cutscene_bundle_fingerprint,
+        cutscene_bundle_content_fingerprint=record.cutscene_bundle_content_fingerprint,
     )
 
 
@@ -830,6 +854,119 @@ def _publish_new(stage: Path, target: Path) -> None:
     else:
         os.link(stage, target)
         stage.unlink()
+
+
+class _ModQuarantine:
+    """Pin one Windows file against writes/deletes, then rename by its handle.
+
+    Path-based unlink/replace cannot discard a name that changed after a hash
+    check. This handle denies write/delete sharing, and every rename/disposition
+    operates on that exact opened object. Unsupported filesystems fail closed.
+    """
+
+    def __init__(self, root: Path, relative: str):
+        if os.name != "nt":
+            raise InstallError("Safe managed-mod mutations require Windows file sharing")
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        self.root = root
+        self.relative = relative
+        self.original = _target_path(root, relative)
+        self.path = self.original
+        self.moved = False
+        self.deleted = False
+        self.digest = None
+        self.file = None
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        self.api.CreateFileW.restype = wintypes.HANDLE
+        self.api.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.api.CloseHandle.restype = wintypes.BOOL
+        self.api.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                      wintypes.LPVOID, wintypes.DWORD]
+        self.api.SetFileInformationByHandle.restype = wintypes.BOOL
+        # GENERIC_READ | DELETE, no sharing; OPEN_EXISTING; OPEN_REPARSE_POINT.
+        raw = str(self.original.absolute())
+        extended = "\\\\?\\UNC\\" + raw[2:] if raw.startswith("\\\\") else "\\\\?\\" + raw
+        handle = self.api.CreateFileW(extended, 0x80010000, 0, None, 3, 0x00200000, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise InstallError(f"Cannot lock managed mod file; concurrent access preserved: {relative}: "
+                               f"{ctypes.WinError(ctypes.get_last_error())}", target_paths=(relative,))
+        try:
+            descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except Exception:
+            self.api.CloseHandle(handle)
+            raise
+        try:
+            self.file = os.fdopen(descriptor, "rb")
+        except Exception:
+            os.close(descriptor)
+            raise
+        self.handle = msvcrt.get_osfhandle(descriptor)
+        try:
+            info = os.fstat(descriptor)
+        except Exception:
+            self.close()
+            raise
+        if (not stat.S_ISREG(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            self.close()
+            raise InstallError(f"Managed mod file is redirected or not regular: {relative}",
+                               target_paths=(relative,))
+
+    def _rename(self, destination: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        _directory_path(self.root, destination.parent.relative_to(self.root).as_posix())
+        name = str(destination.absolute()).encode("utf-16-le")
+
+        class RenameInfo(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.DWORD), ("RootDirectory", wintypes.HANDLE),
+                        ("FileNameLength", wintypes.DWORD), ("FileName", ctypes.c_ushort * 1)]
+
+        buffer = ctypes.create_string_buffer(RenameInfo.FileName.offset + len(name) + 2)
+        info = RenameInfo.from_buffer(buffer)
+        info.Flags = 0  # ReplaceIfExists=False: never replace a concurrent name.
+        info.FileNameLength = len(name)
+        ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.FileName.offset, name, len(name))
+        if not self.api.SetFileInformationByHandle(self.handle, 3, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.path = destination
+
+    def capture(self, expected: str) -> None:
+        destination = self.original.parent / f".{self.original.name}.w3sub-quarantine-{uuid.uuid4().hex}.tmp"
+        self._rename(destination)
+        self.moved = True
+        self.file.seek(0)
+        digest = hashlib.sha256()
+        for block in iter(lambda: self.file.read(1024 * 1024), b""):
+            digest.update(block)
+        self.digest = digest.hexdigest()
+        if self.digest != expected:
+            raise InstallError(f"Managed mod bytes changed; quarantined bytes preserved: {self.relative}",
+                               target_paths=(self.relative,))
+
+    def restore(self) -> None:
+        self._rename(self.original)
+        self.moved = False
+
+    def discard(self) -> None:
+        import ctypes
+        # FILE_DISPOSITION_INFO.DeleteFile=True affects this pinned object.
+        disposition = ctypes.c_ubyte(1)
+        if not self.api.SetFileInformationByHandle(self.handle, 4, ctypes.byref(disposition), 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.deleted = True
+        self.close()
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
 
 def _sibling_stage(target: Path, source: Path, prefix: str) -> Path:
@@ -899,6 +1036,8 @@ def _apply_transaction(game: GameInstallation,
     inferred from a missing target; rollback preserves unexpected external bytes.
     """
     root = _normalized_path(game.root)
+    if os.name != "nt" and any(_is_mod_target(relative) for relative in desired_sources):
+        raise InstallError("Safe managed-mod transactions require Windows file sharing; no targets changed")
     if set(desired_sources) != set(desired_hashes) or set(desired_sources) != set(expected_current):
         raise InstallError("Transaction path inventory is inconsistent")
     if (any(_is_mod_target(relative) for relative in desired_sources)
@@ -920,6 +1059,9 @@ def _apply_transaction(game: GameInstallation,
 
     transaction_directory = state_directory / "transactions" / uuid.uuid4().hex
     snapshots: dict[str, Path] = {}
+    quarantines: dict[str, _ModQuarantine] = {}
+    rollback_quarantines: list[_ModQuarantine] = []
+    published_mod_paths: set[str] = set()
     stages: dict[str, Path] = {}
     attempted: list[str] = []
     restore_stages: list[Path] = []
@@ -979,13 +1121,22 @@ def _apply_transaction(game: GameInstallation,
                                        target_paths=(relative,), backup_directory=backup_directory)
             # OS errors can be ambiguous about whether a mutation happened.
             attempted.append(relative)
-            if desired_sources[relative] is None:
-                target.unlink()
+            if _is_mod_target(relative) and expected_current[relative] is not None:
+                quarantine = _ModQuarantine(root, relative)
+                quarantines[relative] = quarantine
+                quarantine.capture(expected_current[relative])
+                if desired_sources[relative] is not None:
+                    _publish_new(stages[relative], target)
+                    published_mod_paths.add(relative)
+            elif desired_sources[relative] is None:
+                raise InstallError(f"Untracked removal is forbidden: {relative}")
             elif expected_current[relative] is None:
                 # Exclusive publication refuses a concurrently created
                 # unmanaged file instead of silently replacing it.
                 try:
                     _publish_new(stages[relative], target)
+                    if _is_mod_target(relative):
+                        published_mod_paths.add(relative)
                 except FileExistsError as error:
                     attempted.pop()  # Exclusive publication made no change.
                     raise InstallError(f"Unmanaged file appeared before creation: {relative}",
@@ -999,6 +1150,10 @@ def _apply_transaction(game: GameInstallation,
                 raise InstallError(f"Installed target hash verification failed: {relative}",
                                    target_paths=(relative,), backup_directory=backup_directory)
             report_progress(progress_callback, f"{operation_name}: verifying installed targets", number, len(targets))
+        # Dispose only the locked objects whose captured bytes matched. Their
+        # verified snapshots remain available if manifest publication fails.
+        for quarantine in quarantines.values():
+            quarantine.discard()
         removed_directories = _remove_empty_created_directories(root, prior_directories | created)
         # Drop successfully removed and already missing directories so a later
         # user-created directory at the same name is never claimed for cleanup.
@@ -1013,29 +1168,69 @@ def _apply_transaction(game: GameInstallation,
         for number, relative in enumerate(reversed(attempted), 1):
             target = targets[relative]
             try:
+                if _is_mod_target(relative):
+                    original = quarantines.get(relative)
+                    if original is not None and original.moved:
+                        if _current_digest(root, relative) is not None:
+                            if relative not in published_mod_paths:
+                                raise OSError(f"concurrent file preserved; original retained at {original.path}")
+                            current = _ModQuarantine(root, relative)
+                            rollback_quarantines.append(current)
+                            try:
+                                current.capture(desired_hashes[relative])
+                            except Exception:
+                                if current.moved:
+                                    current.restore()
+                                raise
+                            current.discard()
+                        if original.deleted:
+                            _create_target_parents(root, relative, created)
+                            restore_stage = _sibling_stage(target, snapshots[relative], "w3sub-rollback")
+                            restore_stages.append(restore_stage)
+                            if _hash_file(restore_stage) != expected_current[relative]:
+                                raise OSError("rollback snapshot hash changed")
+                            _publish_new(restore_stage, target)
+                        else:
+                            _create_target_parents(root, relative, created)
+                            original.restore()
+                            original.close()
+                            if original.digest != expected_current[relative]:
+                                raise OSError("concurrent original bytes restored and preserved; resolve conflict")
+                    elif relative in published_mod_paths:
+                        current = _ModQuarantine(root, relative)
+                        rollback_quarantines.append(current)
+                        try:
+                            current.capture(desired_hashes[relative])
+                        except Exception:
+                            if current.moved:
+                                current.restore()
+                            raise
+                        current.discard()
+                    _report_rollback_progress(progress_callback, operation_name, number, len(attempted))
+                    continue
                 current_hash = _current_digest(root, relative)
                 if current_hash != expected_current[relative]:
                     if current_hash != desired_hashes[relative]:
                         raise OSError("unexpected third-party bytes preserved; rollback requires recovery")
-                    if expected_current[relative] is None:
-                        target.unlink()
-                    else:
-                        _create_target_parents(root, relative, created)
-                        restore_stage = _sibling_stage(target, snapshots[relative], "w3sub-rollback")
-                        restore_stages.append(restore_stage)
-                        if _hash_file(restore_stage) != expected_current[relative]:
-                            raise OSError("rollback snapshot hash changed")
-                        if _current_digest(root, relative) != desired_hashes[relative]:
-                            raise OSError("target changed while preparing rollback; unexpected bytes preserved")
-                        if desired_hashes[relative] is None:
-                            _publish_new(restore_stage, target)
-                        else:
-                            os.replace(restore_stage, target)
+                    _create_target_parents(root, relative, created)
+                    restore_stage = _sibling_stage(target, snapshots[relative], "w3sub-rollback")
+                    restore_stages.append(restore_stage)
+                    if _hash_file(restore_stage) != expected_current[relative]:
+                        raise OSError("rollback snapshot hash changed")
+                    if _current_digest(root, relative) != desired_hashes[relative]:
+                        raise OSError("target changed while preparing rollback; unexpected bytes preserved")
+                    os.replace(restore_stage, target)
                     if _current_digest(root, relative) != expected_current[relative]:
                         raise OSError("restored hash does not match the transaction snapshot")
                 _report_rollback_progress(progress_callback, operation_name, number, len(attempted))
             except Exception as rollback_error:
-                rollback_errors.append(f"{relative}: {rollback_error}")
+                preserved = [str(quarantine.path) for quarantine in
+                             (*quarantines.values(), *rollback_quarantines)
+                             if quarantine.relative == relative and quarantine.moved and not quarantine.deleted]
+                detail = f"{relative}: {rollback_error}"
+                if preserved:
+                    detail += "; preserved quarantines: " + ", ".join(preserved)
+                rollback_errors.append(detail)
         for directory in sorted(removed_directories & prior_directories,
                                 key=lambda value: (value.count("/"), value)):
             try:
@@ -1064,6 +1259,8 @@ def _apply_transaction(game: GameInstallation,
         raise InstallError(message, target_paths=tuple(sorted(paths)), rollback_errors=rollback_errors,
                            backup_directory=backup_directory) from operation_error
     finally:
+        for quarantine in (*quarantines.values(), *rollback_quarantines):
+            quarantine.close()  # Undiscarded originals remain named for recovery.
         for stage in (*stages.values(), *restore_stages):
             try:
                 relative = stage.parent.relative_to(root).as_posix()
@@ -1227,6 +1424,8 @@ def _freshness(manifest: InstallManifest, game: GameInstallation, *,
     if fingerprint != manifest.source_fingerprint:
         return Freshness.STALE
     if manifest.cutscene_bundle_fingerprint is not None:
+        if manifest.cutscene_bundle_content_fingerprint is None:
+            return Freshness.STALE
         if game.version != manifest.install_version:
             return Freshness.STALE
         try:
@@ -1370,7 +1569,9 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         prepared_targets.update(final_targets)
         prepared = replace(final, target_files=prepared_targets, prepared=True,
             cutscene_bundle_fingerprint=(final.cutscene_bundle_fingerprint
-                                         or manifest.cutscene_bundle_fingerprint))
+                                         or manifest.cutscene_bundle_fingerprint),
+            cutscene_bundle_content_fingerprint=(final.cutscene_bundle_content_fingerprint
+                                                 or manifest.cutscene_bundle_content_fingerprint))
 
         desired_sources = dict(outputs)
         desired_hashes = dict(output_hashes)
