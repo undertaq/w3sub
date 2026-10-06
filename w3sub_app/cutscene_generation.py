@@ -191,7 +191,11 @@ def build_cutscene_overrides(
             path = safe_relative_path(entry.depot_path)
         except ValueError as error:
             skipped(entry.depot_path, "", str(error))
-            counts["usm_skipped" if entry.depot_path.casefold().endswith(".usm") else "sidecar_skipped"] += 1
+            kind = "usm" if entry.depot_path.casefold().endswith(".usm") else "sidecar"
+            # Unsafe paths never enter the valid resource groups. Count their
+            # discovery here alongside their skip, exactly once per entry.
+            counts[f"{kind}_discovered"] += 1
+            counts[f"{kind}_skipped"] += 1
             continue
         candidates.setdefault(path, []).append(entry)
     resources: dict[str, BundleEntry] = {}
@@ -208,13 +212,17 @@ def build_cutscene_overrides(
         if path.endswith(".subs"):
             key = _sidecar_key(path)
             if key is None:
+                # Key-less paths also cannot contribute a logical stem.
+                counts["sidecar_discovered"] += 1
                 counts["sidecar_skipped"] += 1
                 skipped(path, "", "sidecar has no resource stem and locale suffix")
             elif key[1] in (primary_language, secondary_language):
                 sidecars.setdefault(key[0], {}).setdefault(key[1], []).append(path)
     movies = sorted(path for path in candidates if path.endswith(".usm"))
-    counts["sidecar_discovered"] = len(sidecars) + counts["sidecar_skipped"]
-    counts["usm_discovered"] = len(movies) + counts["usm_skipped"]
+    # Valid groups are disjoint from the malformed discoveries counted above.
+    # Later skips are already represented by these groups' discovery totals.
+    counts["sidecar_discovered"] += len(sidecars)
+    counts["usm_discovered"] += len(movies)
     counts["estimated_work_bytes"] = sum(entry.uncompressed_size for entry in resources.values()
                                          if entry.depot_path.casefold().endswith(".usm")
                                          or (_sidecar_key(safe_relative_path(entry.depot_path)) or ("", ""))[1]
