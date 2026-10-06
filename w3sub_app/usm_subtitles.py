@@ -423,8 +423,32 @@ def patch_usm_stream(
     subtitle_keys = [key for key in headers if key[0] == b"@SBT"]
     if len(subtitle_keys) > 1:
         raise USMReadError("multiple physical subtitle streams are unsupported")
-    if subtitles:
+    if subtitle_keys:
         sub_header = headers[subtitle_keys[0]].rows[0]
+        # These are observed timing profiles, not a guessed unit conversion:
+        # the 5.00 subtitle header uses 30, whereas individual cues use either
+        # 1000 (base-game movies) or 10 (the DLC teleport movie).
+        header_unit = sub_header["time_unit"].value
+        if header_unit != 30:
+            raise USMReadError(f"unsupported subtitle header time_unit {header_unit}; expected 30")
+        for item in subtitles:
+            if (header_unit, item.unit) not in ((30, 1000), (30, 10)):
+                raise USMReadError(
+                    f"unsupported subtitle header/cue time units {header_unit}/{item.unit} "
+                    f"at {item.chunk.offset}"
+                )
+        # Twenty-nine shipped subtitle streams declare zero despite having
+        # nonzero cue intervals. Zero therefore supplies no usable end bound.
+        # The sole nonzero sample (recap_wip: 6, cues through 189.8 seconds)
+        # does not establish an extent formula. Refuse it rather than silently
+        # trusting a duration that cannot be checked against every cue.
+        total_time = sub_header["total_time"].value
+        if total_time != 0:
+            raise USMReadError(
+                f"unsupported subtitle total_time {total_time}; "
+                "nonzero header extent semantics cannot be verified against cue intervals"
+            )
+    if subtitles:
         if (max(item.text_size for item in subtitles) != sub_header["content_xsize"].value
                 or any(item.cue.locale_id >= sub_header["num_channels"].value for item in subtitles)
                 or max(item.chunk.size for item in subtitles) > sub_header["ixsize"].value):
