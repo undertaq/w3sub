@@ -85,10 +85,7 @@ def _parse(data: bytes, label: str) -> _Sidecar:
 
         fields = content.split(",", 2)
         if len(fields) != 3:
-            if "," in content:
-                raise ValueError(f"{label} .subs line {line_number}: malformed cue row")
-            rows.append(_Row(content, ending))
-            continue
+            raise ValueError(f"{label} .subs line {line_number}: malformed cue row")
         try:
             start = int(fields[0].strip())
             end = int(fields[1].strip())
