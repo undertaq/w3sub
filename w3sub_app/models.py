@@ -137,9 +137,10 @@ class GenerationProvenance:
 @dataclass(frozen=True)
 class InstallTarget:
     relative_path: str
-    backup_path: Path
-    original_sha256: str
+    backup_path: Path | None
+    original_sha256: str | None
     installed_sha256: str
+    original_exists: bool = True
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,8 @@ class InstallManifest:
     conflict_paths: tuple[str, ...] = ()
     prepared: bool = False
     generation_provenance: GenerationProvenance | None = None
+    cutscene_bundle_fingerprint: ResourceFingerprint | None = None
+    created_directories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
