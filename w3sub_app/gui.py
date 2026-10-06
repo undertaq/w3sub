@@ -323,6 +323,7 @@ def show_scrollable_dialog(parent: tk.Misc, title: str, text: str,
                            *, confirm: bool = False) -> bool | None:
     """Show long read-only details in a screen-bounded, scrollable window."""
     window = tk.Toplevel(parent)
+    window.withdraw()
     window.title(title)
     window.transient(parent.winfo_toplevel())
     window.resizable(True, True)
@@ -378,8 +379,16 @@ def show_scrollable_dialog(parent: tk.Misc, title: str, text: str,
         window.bind("<Escape>", lambda _event: close())
         window.protocol("WM_DELETE_WINDOW", close)
 
+    # On Windows, grabbing a newly created but not-yet-mapped Toplevel can
+    # fail silently from the user's perspective: the parent waits for a modal
+    # window that never receives focus. Map and raise it before taking the grab.
+    window.deiconify()
+    window.update_idletasks()
+    window.lift()
+    window.wait_visibility()
     window.grab_set()
     (no_button if confirm else close_button).focus_set()
+    window.focus_force()
     parent.wait_window(window)
     return result["accepted"] if confirm else None
 
@@ -1258,10 +1267,13 @@ class W3DualSubtitleApp:
         targets = tuple(str(root.joinpath(*Path(path).parts)) for path in relative_targets)
         text = confirmation_text("Modify", root, record.primary_language,
                                  record.secondary_language, targets)
-        confirm_then_submit(
+        self.status_var.set("Review the target list in the confirmation window.")
+        confirmed = confirm_then_submit(
             self._confirm_scrollable, "Confirm dual subtitle modification", text,
             lambda: self._submit("modify install", operation, self._lifecycle_completed),
         )
+        if not confirmed:
+            self.status_var.set("Modify cancelled; the active install was not changed.")
 
     def _uninstall(self):
         if not self.snapshot or not self.snapshot.manifest:
@@ -1302,10 +1314,13 @@ class W3DualSubtitleApp:
             "Uninstall", root, manifest.primary_language, manifest.secondary_language,
             targets, manifest.backup_directory,
         )
-        confirm_then_submit(
+        self.status_var.set("Review the target list in the confirmation window.")
+        confirmed = confirm_then_submit(
             self._confirm_scrollable, "Confirm dual subtitle removal", text,
             lambda: self._submit("uninstall", operation, self._lifecycle_completed),
         )
+        if not confirmed:
+            self.status_var.set("Uninstall cancelled; the active install was not changed.")
 
     def _lifecycle_completed(self, result):
         operation_result, snapshot, completed_paths = result
