@@ -370,19 +370,27 @@ def write_bundle_entry(
                     emit(chunk)
                     continue
                 pending = chunk
-                while pending:
-                    limit = entry.uncompressed_size - written + 1
-                    piece = decoder.decompress(pending, max(1, limit))
+                while True:
+                    piece = decoder.decompress(pending, _READ_CHUNK_SIZE)
                     pending = decoder.unconsumed_tail
                     if decoder.unused_data:
                         raise BundleReadError(path, f"entry {entry.entry_index} has trailing zlib data")
                     if pending and not piece:
                         raise BundleReadError(path, f"entry {entry.entry_index} has invalid zlib data")
                     emit(piece)
+                    if not pending and len(piece) < _READ_CHUNK_SIZE:
+                        break
 
             if decoder is not None:
-                tail = decoder.flush(max(1, entry.uncompressed_size - written + 1))
-                emit(tail)
+                # Drain output buffered by zlib in fixed-size pieces. Once a
+                # short result is returned, no more output is pending.
+                while True:
+                    tail = decoder.decompress(b"", _READ_CHUNK_SIZE)
+                    if decoder.unused_data:
+                        raise BundleReadError(path, f"entry {entry.entry_index} has trailing zlib data")
+                    emit(tail)
+                    if len(tail) < _READ_CHUNK_SIZE:
+                        break
                 if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
                     raise BundleReadError(path, f"entry {entry.entry_index} has invalid zlib data")
 
