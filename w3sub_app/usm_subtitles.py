@@ -145,7 +145,10 @@ def _chunks(source: BinaryIO, size: int) -> Iterator[_Chunk]:
         if padding > length - 32 or h[15] not in (0, 1, 2, 3):
             raise USMReadError(f"invalid USM payload/padding bounds at {offset}")
         if offset == 0:
-            if h[:4] != b"CRID" or h[15] != 1 or h[12] != 0:
+            # CRI uses this byte as the directory stream channel in some
+            # shipped movies (the game-start recap uses channel 12). The
+            # directory table and its stream rows are validated below.
+            if h[:4] != b"CRID" or h[15] != 1:
                 raise USMReadError("USM must start with a CRID directory")
         elif h[:4] not in _KINDS:
             raise USMReadError(f"unsupported USM chunk {h[:4]!r} at {offset}")
@@ -245,14 +248,33 @@ def _check_schema(chunk: _Chunk, table: _Table) -> None:
                     ("minchk", 0x52), ("minbuf", 0x54), ("avbps", 0x54))
         alternate = tuple((key, 0x54 if key in ("fmtver", "datasize") else flag)
                           for key, flag in expected)
-        valid = table.name == "CRIUSF_DIR_STREAM" and table.columns in (expected, alternate)
-        valid = valid and all(row["fmtver"].value == row["datasize"].value == 0 for row in table.rows)
+        no_fmtver = (("filename", 0x5A), ("filesize", 0x54), ("datasize", 0x54),
+                     ("stmid", 0x54), ("chno", 0x52), ("minchk", 0x52),
+                     ("minbuf", 0x54), ("avbps", 0x54))
+        valid = table.name == "CRIUSF_DIR_STREAM" and table.columns in (
+            expected, alternate, no_fmtver,
+        )
+        valid = valid and all(
+            row["datasize"].value == 0
+            and ("fmtver" not in row or row["fmtver"].value == 0)
+            for row in table.rows
+        )
     elif kind == b"@SFV" and chunk.kind == 3:
-        valid = table.name == "VIDEO_SEEKINFO" and table.columns == _SEEK_COLUMNS
+        row_seek_columns = (
+            ("ofs_byte", 0x56), ("ofs_frmid", 0x55),
+            ("num_skip", 0x53), ("resv", 0x53),
+        )
+        valid = (table.name == "VIDEO_SEEKINFO"
+                 and table.columns in (_SEEK_COLUMNS, row_seek_columns))
         valid = valid and all(row["num_skip"].value == row["resv"].value == 0
                               and row["ofs_frmid"].value >= 0 for row in table.rows)
     elif kind == b"@SFV" and chunk.kind == 1:
-        valid = table.name == "VIDEO_HDRINFO" and table.columns == _VIDEO_COLUMNS + _VIDEO_TAIL
+        profile_columns = (("mpeg_profile", 0x50), ("mpeg_level", 0x50))
+        valid = table.name == "VIDEO_HDRINFO" and table.columns in (
+            _VIDEO_COLUMNS + _VIDEO_TAIL,
+            _VIDEO_COLUMNS + _VIDEO_TAIL[:7],
+            _VIDEO_COLUMNS + profile_columns + _VIDEO_TAIL,
+        )
     elif kind == b"@SFA" and chunk.kind == 1:
         valid = table.name == "AUDIO_HDRINFO" and table.columns in (
             _AUDIO_COLUMNS, _AUDIO_COLUMNS + (("ambisonics", 0x50),))
@@ -437,17 +459,11 @@ def patch_usm_stream(
                     f"unsupported subtitle header/cue time units {header_unit}/{item.unit} "
                     f"at {item.chunk.offset}"
                 )
-        # Twenty-nine shipped subtitle streams declare zero despite having
-        # nonzero cue intervals. Zero therefore supplies no usable end bound.
-        # The sole nonzero sample (recap_wip: 6, cues through 189.8 seconds)
-        # does not establish an extent formula. Refuse it rather than silently
-        # trusting a duration that cannot be checked against every cue.
-        total_time = sub_header["total_time"].value
-        if total_time != 0:
-            raise USMReadError(
-                f"unsupported subtitle total_time {total_time}; "
-                "nonzero header extent semantics cannot be verified against cue intervals"
-            )
+        # Preserve total_time verbatim. Shipped files use both zero and
+        # nonzero values (recap_wip declares 6 while its cues extend to about
+        # 190 seconds), so it is not a reliable cue-range bound. Individual
+        # cue timing, locale IDs, and both text/chunk capacities are validated
+        # below; none of these edits change subtitle timing or this field.
     if subtitles:
         if (max(item.text_size for item in subtitles) != sub_header["content_xsize"].value
                 or any(item.cue.locale_id >= sub_header["num_channels"].value for item in subtitles)
