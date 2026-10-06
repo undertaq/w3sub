@@ -90,10 +90,19 @@ def _cutscene_summary_text(record: GenerationRecord) -> str:
         f"USM: {summary.usm_changed:,} changed, {summary.usm_skipped:,} skipped, "
         f"{summary.usm_unchanged:,} unchanged of {summary.usm_discovered:,}; "
         f"cue matches: {summary.matched_cues:,}/{summary.primary_cues:,} primary ({ratio}); "
+        f"unmatched cues: {summary.unmatched_count:,}; "
         f"estimated scan/work: {_format_bytes(summary.estimated_work_bytes)}; "
         f"estimated output: {_format_bytes(summary.estimated_output_bytes)}; "
         f"actual output: {_format_bytes(summary.output_bytes)}"
     )
+
+
+def _generation_install_relative_paths(record: GenerationRecord) -> set[str]:
+    """Return every output path using the same relative names as the install manifest."""
+    targets = set(record.output_files)
+    targets.update(f"{install.MOD_CONTENT}/{relative}"
+                   for relative in record.cutscene_output_files)
+    return targets
 
 
 def _progress_phase_text(update: ProgressUpdate) -> str:
@@ -753,6 +762,7 @@ class W3DualSubtitleApp:
                          if snapshot and snapshot.generation_record else None)
         if snapshot and snapshot.generation_record:
             record = snapshot.generation_record
+            generated_install_paths = _generation_install_relative_paths(record)
             freshness_label = (snapshot.generation_freshness.value.replace("_", " ")
                                if snapshot.generation_freshness else "unknown")
             for relative, digest in sorted(record.output_hashes.items()):
@@ -766,12 +776,16 @@ class W3DualSubtitleApp:
             manifest = snapshot.manifest
             if manifest and manifest.active:
                 for relative, target_record in sorted(manifest.target_files.items()):
-                    if relative not in record.output_files:
-                        target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
-                        self.preview.insert(
-                            "", "end",
-                            values=(f"RESTORE original: {target} — {target_record.original_sha256}",),
-                        )
+                    if relative in generated_install_paths:
+                        continue
+                    target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
+                    if relative.startswith(install.MOD_CONTENT + "/"):
+                        label, digest = "REMOVE managed override", target_record.installed_sha256
+                    else:
+                        label, digest = "RESTORE original", target_record.original_sha256
+                    self.preview.insert(
+                        "", "end", values=(f"{label}: {target} — {digest}",),
+                    )
             self.status_var.set(
                 f"Generation {record.generation_id}: "
                 f"{freshness_label}; "
@@ -1095,10 +1109,12 @@ class W3DualSubtitleApp:
                 game, record, state, progress_callback=progress_callback,
             )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
-            return result, self._load_game_snapshot(refreshed, progress_callback), tuple(record.output_files)
+            completed = tuple(sorted(_generation_install_relative_paths(record)))
+            return result, self._load_game_snapshot(refreshed, progress_callback), completed
 
         root = self.snapshot.selected.game.root
-        targets = tuple(str(root.joinpath(*Path(path).parts)) for path in record.output_files)
+        relative_targets = _generation_install_relative_paths(record)
+        targets = tuple(str(root.joinpath(*Path(path).parts)) for path in relative_targets)
         text = confirmation_text("Install", root, record.primary_language,
                                  record.secondary_language, targets)
         confirm_then_submit(
@@ -1134,11 +1150,12 @@ class W3DualSubtitleApp:
                 game, record, manifest, progress_callback=progress_callback,
             )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
-            completed = tuple(set(record.output_files) | set(manifest.target_files))
+            completed = tuple(sorted(_generation_install_relative_paths(record)
+                                     | set(manifest.target_files)))
             return result, self._load_game_snapshot(refreshed, progress_callback), completed
 
         root = self.snapshot.selected.game.root
-        relative_targets = set(record.output_files)
+        relative_targets = _generation_install_relative_paths(record)
         relative_targets.update(reviewed_manifest.target_files)
         targets = tuple(str(root.joinpath(*Path(path).parts)) for path in relative_targets)
         text = confirmation_text("Modify", root, record.primary_language,
