@@ -98,8 +98,14 @@ def _aggregate_fingerprint(entries: dict[str, str]) -> ResourceFingerprint:
     return ResourceFingerprint(entries, aggregate.hexdigest())
 
 
-def _bundle_file_identity(info) -> tuple[int, int, int, int, int]:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+def _bundle_file_identity(info) -> tuple[int, int, int, int, int | None]:
+    # On Windows, st_ctime_ns is deprecated and can mean creation time for
+    # path stat but metadata-change time for fstat. Use birth time when the
+    # runtime exposes it so path and handle identities compare consistently.
+    # The streamed table/content digests, not this timestamp, detect edits.
+    change_marker = (getattr(info, "st_birthtime_ns", None)
+                     if os.name == "nt" else info.st_ctime_ns)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, change_marker)
 
 
 def _fingerprint_bundle_tables(
