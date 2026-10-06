@@ -319,6 +319,71 @@ def confirm_then_submit(confirm, title: str, text: str, submit) -> bool:
     return True
 
 
+def show_scrollable_dialog(parent: tk.Misc, title: str, text: str,
+                           *, confirm: bool = False) -> bool | None:
+    """Show long read-only details in a screen-bounded, scrollable window."""
+    window = tk.Toplevel(parent)
+    window.title(title)
+    window.transient(parent.winfo_toplevel())
+    window.resizable(True, True)
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    width = min(720, max(320, screen_width - 80))
+    height = min(480, max(240, screen_height - 100))
+    window.minsize(min(420, width), min(300, height))
+    window.maxsize(screen_width, screen_height)
+    parent_top = parent.winfo_toplevel()
+    parent_top.update_idletasks()
+    x = parent_top.winfo_rootx() + max(0, (parent_top.winfo_width() - width) // 2)
+    y = parent_top.winfo_rooty() + max(0, (parent_top.winfo_height() - height) // 2)
+    x = min(x, max(0, screen_width - width))
+    y = min(y, max(0, screen_height - height))
+    window.geometry(f"{width}x{height}+{x}+{y}")
+    window.columnconfigure(0, weight=1)
+    window.rowconfigure(0, weight=1)
+
+    content = ttk.Frame(window, padding=10)
+    content.grid(row=0, column=0, sticky="nsew")
+    content.columnconfigure(0, weight=1)
+    content.rowconfigure(0, weight=1)
+    details = tk.Text(content, wrap="word", state="normal", padx=6, pady=6)
+    details.grid(row=0, column=0, sticky="nsew")
+    scrollbar = ttk.Scrollbar(content, orient="vertical", command=details.yview)
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    details.configure(yscrollcommand=scrollbar.set)
+    details.insert("1.0", text)
+    details.configure(state="disabled")
+
+    result = {"accepted": False}
+
+    def close(accepted=False):
+        result["accepted"] = accepted
+        if window.winfo_exists():
+            window.destroy()
+
+    buttons = ttk.Frame(content)
+    buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8, 0))
+    if confirm:
+        no_button = ttk.Button(buttons, text="No", command=close)
+        no_button.pack(side="right", padx=(6, 0))
+        yes_button = ttk.Button(
+            buttons, text="Yes", command=lambda: close(True),
+        )
+        yes_button.pack(side="right")
+        window.bind("<Escape>", lambda _event: close())
+        window.protocol("WM_DELETE_WINDOW", close)
+    else:
+        close_button = ttk.Button(buttons, text="Close", command=close)
+        close_button.pack(side="right")
+        window.bind("<Escape>", lambda _event: close())
+        window.protocol("WM_DELETE_WINDOW", close)
+
+    window.grab_set()
+    (no_button if confirm else close_button).focus_set()
+    parent.wait_window(window)
+    return result["accepted"] if confirm else None
+
+
 def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
     """Identify the active install targets and backups shown in a confirmation."""
     targets = tuple(sorted(
@@ -512,6 +577,11 @@ class W3DualSubtitleApp:
             state="disabled",
         )
         self.unmatched_button.pack(side="left", padx=(0, 6))
+        self.cutscene_details_button = ttk.Button(
+            reports, text="Cutscene details", command=self._show_cutscene_details,
+            state="disabled",
+        )
+        self.cutscene_details_button.pack(side="left", padx=6)
         self.cutscene_unmatched_button = ttk.Button(
             reports, text="Cutscene unmatched CSV", command=self._open_cutscene_unmatched,
             state="disabled",
@@ -561,6 +631,8 @@ class W3DualSubtitleApp:
              "Scan game bundles for .subs and .usm subtitles. This can read several GB and take a while; the preview estimates scan work and output size. Staged outputs plus the installed Mods copy can use about twice the output estimate, plus temporary space. Cutscene text keeps native NUL line breaks. Clear this option to skip cutscenes."),
             (self.generate_button, "Check semantic compatibility and create a preview before installing."),
             (self.unmatched_button, "Open the interactive w3strings entries that could not be matched."),
+            (self.cutscene_details_button,
+             "Review cutscene scan counts, subtitle matching, output size, and generated resources."),
             (self.cutscene_unmatched_button, "Open cutscene cues and resources that could not be matched or were skipped."),
             (self.install_button, "Review exact targets, back up originals, and install a fresh generated preview."),
             (self.modify_button, "Apply a new preview to an active install while preserving original backups."),
@@ -643,6 +715,7 @@ class W3DualSubtitleApp:
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
                        self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
                        self.full_mode, self.dialogue_mode, self.include_cutscenes_check,
+                       self.cutscene_details_button,
                        self.rescan_button, self.unmatched_button, self.cutscene_unmatched_button):
             try:
                 widget.configure(state=state)
@@ -659,6 +732,10 @@ class W3DualSubtitleApp:
             )
             self.cutscene_unmatched_button.configure(
                 state="normal" if self._cutscene_unmatched_report_path() else "disabled"
+            )
+            self.cutscene_details_button.configure(
+                state=("normal" if self.snapshot and self.snapshot.generation_record
+                       and self.snapshot.generation_record.include_cutscenes else "disabled")
             )
 
     def _startup_scan(self, progress_callback: ProgressCallback):
@@ -1040,16 +1117,37 @@ class W3DualSubtitleApp:
                                     generation_freshness=freshness)
         self._render_generation_and_install()
         merge_summary = _merge_summary(record)
-        stats_text = f"; {merge_summary}" if merge_summary else ""
-        unmatched_text = (f"; {record.unmatched_entries_count:,} unmatched identities"
-                          if record.unmatched_entries_count is not None else "")
         targets_count = len(record.output_files) + len(record.cutscene_output_files)
+        status_parts = [f"{targets_count:,} target files"]
+        if merge_summary:
+            status_parts.append(merge_summary)
+        if record.unmatched_entries_count is not None:
+            status_parts.append(f"{record.unmatched_entries_count:,} unmatched identities")
+        if record.include_cutscenes:
+            status_parts.append("Cutscene details available")
         self.status_var.set(
-            f"Preview ready: {targets_count} target files{stats_text}{unmatched_text}; "
-            f"source freshness {freshness.value}.\n{_cutscene_summary_text(record)} "
-            "Review paths and hashes before Install or Modify."
+            f"Preview ready: {'; '.join(status_parts)}. "
+            f"Source freshness: {freshness.value}. Review paths and hashes before Install or Modify."
         )
         self._refresh_action_buttons()
+
+    def _show_cutscene_details(self):
+        record = self.snapshot.generation_record if self.snapshot else None
+        if record is None or not record.include_cutscenes:
+            return
+        lines = [_cutscene_summary_text(record), ""]
+        resources = sorted(record.cutscene_output_files)
+        lines.append(f"Generated cutscene resources ({len(resources):,}):")
+        lines.extend(f"  {resource}" for resource in resources)
+        if not resources:
+            lines.append("  (none)")
+        report = self._cutscene_unmatched_report_path()
+        if report is not None:
+            lines.extend(("", f"Unmatched report: {report}"))
+        show_scrollable_dialog(self.root, "Cutscene preview details", "\n".join(lines))
+
+    def _confirm_scrollable(self, title: str, text: str) -> bool:
+        return show_scrollable_dialog(self.root, title, text, confirm=True) is True
 
     def _unmatched_report_path(self) -> Path | None:
         record = self.snapshot.generation_record if self.snapshot else None
@@ -1118,7 +1216,7 @@ class W3DualSubtitleApp:
         text = confirmation_text("Install", root, record.primary_language,
                                  record.secondary_language, targets)
         confirm_then_submit(
-            messagebox.askyesno, "Confirm dual subtitle install", text,
+            self._confirm_scrollable, "Confirm dual subtitle install", text,
             lambda: self._submit("install", operation, self._lifecycle_completed),
         )
 
@@ -1161,7 +1259,7 @@ class W3DualSubtitleApp:
         text = confirmation_text("Modify", root, record.primary_language,
                                  record.secondary_language, targets)
         confirm_then_submit(
-            messagebox.askyesno, "Confirm dual subtitle modification", text,
+            self._confirm_scrollable, "Confirm dual subtitle modification", text,
             lambda: self._submit("modify install", operation, self._lifecycle_completed),
         )
 
@@ -1205,17 +1303,19 @@ class W3DualSubtitleApp:
             targets, manifest.backup_directory,
         )
         confirm_then_submit(
-            messagebox.askyesno, "Confirm dual subtitle removal", text,
+            self._confirm_scrollable, "Confirm dual subtitle removal", text,
             lambda: self._submit("uninstall", operation, self._lifecycle_completed),
         )
 
     def _lifecycle_completed(self, result):
         operation_result, snapshot, completed_paths = result
         self._apply_snapshot(snapshot)
-        self.status_var.set(completed_paths_text(
-            snapshot.selected.game.root, completed_paths,
-            getattr(operation_result, "backup_directory", None),
-        ))
+        completed_count = len(completed_paths)
+        backup_directory = getattr(operation_result, "backup_directory", None)
+        status = f"Operation completed: {completed_count:,} file(s)."
+        if backup_directory is not None:
+            status += f" Original backups: {backup_directory}"
+        self.status_var.set(status)
         self._refresh_action_buttons()
 
     def _rescan_current(self):
