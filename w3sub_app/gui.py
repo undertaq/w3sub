@@ -69,6 +69,66 @@ def _merge_summary(record: GenerationRecord) -> str | None:
     return f"Merged {merged:,} of {total:,} entries ({ratio:.1f}%)"
 
 
+def _format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _cutscene_summary_text(record: GenerationRecord) -> str:
+    if not record.include_cutscenes:
+        return "Cutscene subtitles: not included."
+    summary = record.cutscene_summary
+    ratio = (f"{summary.match_ratio:.1%}" if summary.primary_cues else "n/a")
+    return (
+        "Cutscenes — "
+        f"sidecars: {summary.sidecar_changed:,} changed, {summary.sidecar_skipped:,} skipped, "
+        f"{summary.sidecar_unchanged:,} unchanged of {summary.sidecar_discovered:,}; "
+        f"USM: {summary.usm_changed:,} changed, {summary.usm_skipped:,} skipped, "
+        f"{summary.usm_unchanged:,} unchanged of {summary.usm_discovered:,}; "
+        f"cue matches: {summary.matched_cues:,}/{summary.primary_cues:,} primary ({ratio}); "
+        f"estimated scan/work: {_format_bytes(summary.estimated_work_bytes)}; "
+        f"estimated output: {_format_bytes(summary.estimated_output_bytes)}; "
+        f"actual output: {_format_bytes(summary.output_bytes)}"
+    )
+
+
+def _progress_phase_text(update: ProgressUpdate) -> str:
+    """Give the expensive bundle and streaming phases a clear user-facing label."""
+    phase = update.phase
+    labels = (
+        ("Hashing cutscene source bundles", "Scanning cutscene bundle bytes"),
+        ("Rechecking cutscene bundle contents", "Verifying cutscene bundle bytes"),
+        ("Extracting cutscene USM", "Extracting cutscene video"),
+        ("Patching cutscene USM", "Writing cutscene subtitle track"),
+        ("Extracting sidecar", "Reading cutscene subtitle sidecar"),
+        ("Scanning cutscene bundle tables", "Finding cutscene resources"),
+        ("Merging cutscene sidecar resources", "Merging cutscene subtitle files"),
+        ("Processing cutscene USM resources", "Processing cutscene videos"),
+        ("Rechecking cutscene bundle metadata", "Rechecking cutscene bundle indexes"),
+    )
+    for marker, label in labels:
+        if marker.casefold() in phase.casefold():
+            return label
+    return phase
+
+
+def _progress_status(update: ProgressUpdate) -> str:
+    phase = _progress_phase_text(update)
+    if update.total is None:
+        return phase
+    byte_phase = any(marker.casefold() in update.phase.casefold() for marker in (
+        "Hashing cutscene source bundles", "Rechecking cutscene bundle contents",
+        "Extracting cutscene USM", "Patching cutscene USM", "Extracting sidecar",
+    ))
+    if byte_phase:
+        return f"{phase}: {_format_bytes(update.completed)} / {_format_bytes(update.total)}"
+    return f"{phase}: {update.completed:,} / {update.total:,}"
+
+
 def _path_identity(path: Path) -> str:
     try:
         resolved = Path(path).expanduser().resolve(strict=False)
@@ -353,8 +413,8 @@ class W3DualSubtitleApp:
         self._allow_game_value_event = False
         self._build_widgets()
         self.root.title("Witcher 3 Dual Subtitle Manager")
-        self.root.geometry("900x560")
-        self.root.minsize(760, 520)
+        self.root.geometry("900x620")
+        self.root.minsize(760, 560)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self._poll_messages)
@@ -366,7 +426,7 @@ class W3DualSubtitleApp:
         frame = ttk.Frame(self.root, padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(8, weight=1)
+        frame.rowconfigure(9, weight=1)
 
         ttk.Label(frame, text="Game installation").grid(row=0, column=0, sticky="w")
         self.game_var = tk.StringVar()
@@ -423,31 +483,46 @@ class W3DualSubtitleApp:
         self.mode_reason_var = tk.StringVar()
         ttk.Label(mode, textvariable=self.mode_reason_var, wraplength=780).grid(
             row=1, column=0, columnspan=2, sticky="ew")
+        self.include_cutscenes_var = tk.BooleanVar(value=True)
+        self.include_cutscenes_check = ttk.Checkbutton(
+            mode, text="Include cutscene subtitles", variable=self.include_cutscenes_var,
+            command=self._cutscene_option_changed,
+        )
+        self.include_cutscenes_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         actions = ttk.Frame(frame)
         actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(5, 7))
-        self.generate_button = ttk.Button(actions, text="Generate preview", command=self._generate_preview)
+        commands = ttk.Frame(actions)
+        commands.grid(row=0, column=0, sticky="ew")
+        reports = ttk.Frame(actions)
+        reports.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self.generate_button = ttk.Button(commands, text="Generate preview", command=self._generate_preview)
         self.generate_button.pack(side="left", padx=(0, 6))
         self.unmatched_button = ttk.Button(
-            actions, text="Open unmatched list", command=self._open_unmatched_entries,
+            reports, text="Text unmatched CSV", command=self._open_unmatched_entries,
             state="disabled",
         )
-        self.unmatched_button.pack(side="left", padx=6)
-        self.install_button = ttk.Button(actions, text="Install", command=self._install)
+        self.unmatched_button.pack(side="left", padx=(0, 6))
+        self.cutscene_unmatched_button = ttk.Button(
+            reports, text="Cutscene unmatched CSV", command=self._open_cutscene_unmatched,
+            state="disabled",
+        )
+        self.cutscene_unmatched_button.pack(side="left", padx=6)
+        self.install_button = ttk.Button(commands, text="Install", command=self._install)
         self.install_button.pack(side="left", padx=6)
-        self.modify_button = ttk.Button(actions, text="Modify install", command=self._modify)
+        self.modify_button = ttk.Button(commands, text="Modify install", command=self._modify)
         self.modify_button.pack(side="left", padx=6)
-        self.uninstall_button = ttk.Button(actions, text="Uninstall", command=self._uninstall)
+        self.uninstall_button = ttk.Button(commands, text="Uninstall", command=self._uninstall)
         self.uninstall_button.pack(side="left", padx=6)
-        self.rescan_button = ttk.Button(actions, text="Rescan", command=self._rescan_current)
+        self.rescan_button = ttk.Button(commands, text="Rescan", command=self._rescan_current)
         self.rescan_button.pack(side="right")
         self.help_button = ttk.Button(frame, text="Help", command=lambda: show_help(self.root))
         self.help_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
-        ttk.Label(frame, text="Generation preview — target path and SHA-256").grid(
-            row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(frame, text="Generation preview — install target path and SHA-256").grid(
+            row=8, column=0, columnspan=4, sticky="w")
         preview_frame = ttk.Frame(frame)
-        preview_frame.grid(row=8, column=0, columnspan=4, sticky="nsew")
+        preview_frame.grid(row=9, column=0, columnspan=4, sticky="nsew")
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
         self.preview = ttk.Treeview(preview_frame, columns=("hash",), show="headings", height=5)
@@ -459,9 +534,9 @@ class W3DualSubtitleApp:
         self.preview.configure(yscrollcommand=scroll.set)
         self.status_var = tk.StringVar(value="Ready")
         self.operation_progress = ttk.Progressbar(frame, mode="determinate")
-        self.operation_progress.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(7, 0))
+        self.operation_progress.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(7, 0))
         ttk.Label(frame, textvariable=self.status_var, wraplength=800).grid(
-            row=10, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+            row=11, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         self.operation_progress.grid_remove()
         hints = (
             (self.game_combo, "Select a discovered installation; its language resources are rescanned."),
@@ -473,8 +548,11 @@ class W3DualSubtitleApp:
             (self.secondary_combo, "Choose a different language to append to matching primary entries."),
             (self.dialogue_mode, "Merge matching string IDs with no key hash in either language; keyed entries stay unchanged."),
             (self.full_mode, "Merge all matching entries, including keyed text such as menus and descriptions."),
+            (self.include_cutscenes_check,
+             "Scan game bundles for .subs and .usm subtitles. This can read several GB and take a while; the preview estimates scan work and output size. Staged outputs plus the installed Mods copy can use about twice the output estimate, plus temporary space. Cutscene text keeps native NUL line breaks. Clear this option to skip cutscenes."),
             (self.generate_button, "Check semantic compatibility and create a preview before installing."),
-            (self.unmatched_button, "Open the preview's CSV list of identities that could not be matched."),
+            (self.unmatched_button, "Open the interactive w3strings entries that could not be matched."),
+            (self.cutscene_unmatched_button, "Open cutscene cues and resources that could not be matched or were skipped."),
             (self.install_button, "Review exact targets, back up originals, and install a fresh generated preview."),
             (self.modify_button, "Apply a new preview to an active install while preserving original backups."),
             (self.uninstall_button, "Review exact targets and restore the validated original backups."),
@@ -510,9 +588,7 @@ class W3DualSubtitleApp:
                 label, payload, error = self._messages.get_nowait()
                 if label == "operation progress":
                     _operation_label, update = payload
-                    counts = (f" {update.completed}/{update.total}"
-                              if update.total is not None else "")
-                    self.status_var.set(update.phase + counts)
+                    self.status_var.set(_progress_status(update))
                     if update.total is not None and update.total > 0:
                         self.operation_progress.configure(
                             maximum=update.total, value=update.completed,
@@ -557,8 +633,8 @@ class W3DualSubtitleApp:
         state = "normal" if enabled else "disabled"
         for widget in (self.game_combo, self.browse_button, self.converter_entry,
                        self.converter_button, self.native_codec_button, self.primary_combo, self.secondary_combo,
-                       self.full_mode, self.dialogue_mode, self.rescan_button,
-                       self.unmatched_button):
+                       self.full_mode, self.dialogue_mode, self.include_cutscenes_check,
+                       self.rescan_button, self.unmatched_button, self.cutscene_unmatched_button):
             try:
                 widget.configure(state=state)
             except tk.TclError:
@@ -571,6 +647,9 @@ class W3DualSubtitleApp:
             self.dialogue_mode.configure(state="normal" if self.snapshot else "disabled")
             self.unmatched_button.configure(
                 state="normal" if self._unmatched_report_path() else "disabled"
+            )
+            self.cutscene_unmatched_button.configure(
+                state="normal" if self._cutscene_unmatched_report_path() else "disabled"
             )
 
     def _startup_scan(self, progress_callback: ProgressCallback):
@@ -664,6 +743,9 @@ class W3DualSubtitleApp:
         self.unmatched_button.configure(
             state="normal" if self._unmatched_report_path() else "disabled"
         )
+        self.cutscene_unmatched_button.configure(
+            state="normal" if self._cutscene_unmatched_report_path() else "disabled"
+        )
         record = snapshot.generation_record if snapshot else None
         unmatched_count = (record.unmatched_entries_count
                            if record and record.unmatched_entries_count is not None else None)
@@ -675,6 +757,11 @@ class W3DualSubtitleApp:
                                if snapshot.generation_freshness else "unknown")
             for relative, digest in sorted(record.output_hashes.items()):
                 target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
+                self.preview.insert("", "end", values=(f"{target} — {digest}",))
+            for relative, digest in sorted(record.cutscene_output_hashes.items()):
+                target = snapshot.selected.game.root.joinpath(
+                    *install.MOD_CONTENT.split("/"), *Path(relative).parts,
+                )
                 self.preview.insert("", "end", values=(f"{target} — {digest}",))
             manifest = snapshot.manifest
             if manifest and manifest.active:
@@ -692,6 +779,7 @@ class W3DualSubtitleApp:
                 + (f"; {merge_summary}" if merge_summary else "")
                 + (f"; {record.unmatched_entries_count:,} unmatched identities"
                    if record.unmatched_entries_count is not None else "")
+                + f"\n{_cutscene_summary_text(record)}"
             )
         if snapshot and snapshot.manifest and snapshot.manifest.active:
             manifest = snapshot.manifest
@@ -703,6 +791,11 @@ class W3DualSubtitleApp:
                     + (f"; {merge_summary}" if merge_summary else "")
                     + (f"; {unmatched_count:,} unmatched identities"
                        if unmatched_count is not None else "")
+                    + (f"\nPreview source freshness: "
+                       f"{snapshot.generation_freshness.value.replace('_', ' ')}"
+                       if snapshot.generation_freshness else "")
+                    + (f"\n{_cutscene_summary_text(snapshot.generation_record)}"
+                       if snapshot.generation_record else "")
                 )
             else:
                 freshness = (comparison.freshness.value.replace("_", " ")
@@ -713,6 +806,11 @@ class W3DualSubtitleApp:
                     + (f"; {merge_summary}" if merge_summary else "")
                     + (f"; {unmatched_count:,} unmatched identities"
                        if unmatched_count is not None else "")
+                    + (f"\nPreview source freshness: "
+                       f"{snapshot.generation_freshness.value.replace('_', ' ')}"
+                       if snapshot.generation_freshness else "")
+                    + (f"\n{_cutscene_summary_text(snapshot.generation_record)}"
+                       if snapshot.generation_record else "")
                 )
 
     def _candidate_changed(self, _event=None):
@@ -792,6 +890,13 @@ class W3DualSubtitleApp:
     def _mode_changed(self):
         self._refresh_action_buttons()
 
+    def _cutscene_option_changed(self):
+        if self._busy:
+            return
+        self._refresh_action_buttons()
+        state = "enabled" if self.include_cutscenes_var.get() else "disabled"
+        self.status_var.set(f"Cutscene subtitles {state}; generate a new preview to apply the option.")
+
     def _check_readiness(self):
         """Check paths and pairing only; generation owns semantic validation."""
         raw = self.converter_var.get().strip()
@@ -828,6 +933,7 @@ class W3DualSubtitleApp:
             record and record.primary_language == self.primary_var.get().casefold()
             and record.secondary_language == self.secondary_var.get().casefold()
             and record.mode.value == self.mode_var.get()
+            and record.include_cutscenes == self.include_cutscenes_var.get()
         )
         if active and snapshot and snapshot.manifest and record:
             pair_matches = pair_matches and record.generation_id != snapshot.manifest.generation_id
@@ -890,6 +996,7 @@ class W3DualSubtitleApp:
             return
         primary, secondary = self.primary_var.get(), self.secondary_var.get()
         mode = MergeMode(self.mode_var.get())
+        include_cutscenes = self.include_cutscenes_var.get()
         converter_raw = self.converter_var.get().strip()
 
         def operation(progress_callback: ProgressCallback):
@@ -899,7 +1006,10 @@ class W3DualSubtitleApp:
             overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             converter = selected_converter(converter_raw)
             record = generation.generate(
-                GenerationRequest(game, primary, secondary, mode, overrides or None),
+                GenerationRequest(
+                    game, primary, secondary, mode, overrides or None,
+                    include_cutscenes=include_cutscenes,
+                ),
                 self.app_root, converter, progress_callback=progress_callback,
             )
             freshness = generation.compare_generation(
@@ -919,10 +1029,11 @@ class W3DualSubtitleApp:
         stats_text = f"; {merge_summary}" if merge_summary else ""
         unmatched_text = (f"; {record.unmatched_entries_count:,} unmatched identities"
                           if record.unmatched_entries_count is not None else "")
+        targets_count = len(record.output_files) + len(record.cutscene_output_files)
         self.status_var.set(
-            f"Preview ready: {len(record.output_files)} target files{stats_text}{unmatched_text}; "
-            f"source freshness {freshness.value}. "
-            "Open the unmatched list for details; review paths and hashes before Install or Modify."
+            f"Preview ready: {targets_count} target files{stats_text}{unmatched_text}; "
+            f"source freshness {freshness.value}.\n{_cutscene_summary_text(record)} "
+            "Review paths and hashes before Install or Modify."
         )
         self._refresh_action_buttons()
 
@@ -933,19 +1044,36 @@ class W3DualSubtitleApp:
         report = record.generation_dir / "unmatched_entries.csv"
         return report if report.is_file() else None
 
+    def _cutscene_unmatched_report_path(self) -> Path | None:
+        record = self.snapshot.generation_record if self.snapshot else None
+        if record is None or not record.include_cutscenes:
+            return None
+        report = record.generation_dir / "cutscene_unmatched.csv"
+        return report if report.is_file() else None
+
     def _open_unmatched_entries(self):
         report = self._unmatched_report_path()
         if report is None:
             self.status_var.set("No unmatched entries report is available for this preview.")
             return
+        self._open_report(report, "interactive unmatched list")
+
+    def _open_cutscene_unmatched(self):
+        report = self._cutscene_unmatched_report_path()
+        if report is None:
+            self.status_var.set("No cutscene unmatched report is available for this preview.")
+            return
+        self._open_report(report, "cutscene unmatched list")
+
+    def _open_report(self, report: Path, label: str):
         open_file = getattr(os, "startfile", None)
         if not callable(open_file):
-            self.status_var.set(f"Unmatched entries report: {report}")
+            self.status_var.set(f"{label.capitalize()} report: {report}")
             return
         try:
             open_file(str(report))
         except OSError as error:
-            messagebox.showerror("Cannot open unmatched list", f"{error}\n\n{report}")
+            messagebox.showerror(f"Cannot open {label}", f"{error}\n\n{report}")
 
     def _install(self):
         if not self.snapshot or not self.snapshot.generation_record:
