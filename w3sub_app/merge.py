@@ -3,10 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import tempfile
-from typing import Protocol
 
-from .dialogue_index import DialogContext
-from .models import GameInstallation, MergeMode
+from .models import MergeMode
 from .w3strings_native import StringsFile
 
 _DIALOGUE_SEPARATOR = "<br>"
@@ -86,7 +84,6 @@ def _merge_separator(primary_text: str, secondary_text: str,
 
 
 def merge_records(primary: StringsFile, secondary: StringsFile, mode: MergeMode,
-                  dialogue_index=None, current_game=None,
                   stats: MergeStats | None = None,
                   primary_language: str | None = None,
                   secondary_language: str | None = None) -> StringsFile:
@@ -126,21 +123,6 @@ def merge_records(primary: StringsFile, secondary: StringsFile, mode: MergeMode,
 
 class MergeError(RuntimeError):
     """CSV data or a requested merge policy cannot be safely used."""
-
-
-class DialogueIndex(Protocol):
-    """Task 4's validated index boundary; raw/unvalidated indexes fail closed."""
-
-    validated: bool
-
-    def is_current(self, game: GameInstallation) -> bool:
-        ...
-
-    def context_for(self, string_id: str, key: str) -> DialogContext:
-        ...
-
-    def context_for_id(self, string_id: str) -> DialogContext:
-        ...
 
 
 @dataclass(frozen=True)
@@ -243,8 +225,6 @@ def _read_csv(path: Path) -> list[str | _Record]:
 
 
 def merge_csv(primary: Path, secondary: Path, mode: MergeMode,
-              dialogue_index: DialogueIndex | None = None,
-              current_game: GameInstallation | None = None,
               stats: MergeStats | None = None,
               primary_language: str | None = None,
               secondary_language: str | None = None) -> Path:

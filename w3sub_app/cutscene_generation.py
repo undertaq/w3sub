@@ -23,6 +23,7 @@ from .usm_subtitles import USM_LOCALE_IDS, USMReadError, patch_usm_stream
 class CutsceneBuildResult:
     output_files: dict[str, Path]
     output_hashes: dict[str, str]
+    source_bundles: dict[str, tuple[str, ...]]
     bundle_fingerprint: ResourceFingerprint
     summary: CutsceneGenerationSummary
     unmatched_rows: tuple[tuple[str, ...], ...]
@@ -275,8 +276,21 @@ def _sidecar_key(path: str) -> tuple[str, str] | None:
     resource, locale = stem.rsplit("_", 1)
     if not resource or not locale:
         return None
-    parent = ["subs" if part == "altsubs" else part for part in parts[:-1]]
-    return "/".join(parent + [resource]), locale
+    # `subs` and `altsubs` are separate movie resources. In particular, the
+    # Storybook versions can have different cue text and cue counts, so they
+    # must not be grouped and copied over one another as playback aliases.
+    return "/".join(parts[:-1] + [resource]), locale
+
+
+def movie_companion_path(sidecar_path: str) -> str | None:
+    """Return the full movie path paired with a localized .subs sidecar."""
+    key = _sidecar_key(sidecar_path)
+    if key is None:
+        return None
+    parts = key[0].split("/")
+    if len(parts) >= 2 and parts[-2] in ("subs", "altsubs"):
+        parts.pop(-2)
+    return "/".join(parts) + ".usm"
 
 
 def build_cutscene_overrides(
@@ -311,6 +325,7 @@ def build_cutscene_overrides(
     rows: list[tuple[str, ...]] = []
     outputs: dict[str, Path] = {}
     hashes: dict[str, str] = {}
+    source_bundles: dict[str, tuple[str, ...]] = {}
     counts = {name: 0 for name in CutsceneGenerationSummary.__dataclass_fields__}
 
     def skipped(path: str, locale: str, reason: str) -> None:
@@ -366,19 +381,30 @@ def build_cutscene_overrides(
                                          in (primary_language, secondary_language))
     counts["estimated_output_bytes"] = sum(resources[path].uncompressed_size for path in movies
                                            if path in resources)
+    primary_source_paths = {
+        path for locales in sidecars.values()
+        for path in locales.get(primary_language, [])
+    }
     for locales in sidecars.values():
         paths = locales.get(primary_language, [])
         if paths and paths[0] in resources:
-            # UTF-16 text may grow to primary + secondary, with both aliases.
+            # UTF-16 text may grow to primary + secondary, plus any missing
+            # playback alias. Existing primary-language variants are emitted
+            # independently because `subs` and `altsubs` can differ.
             primary_size = resources[paths[0]].uncompressed_size
             secondary_paths = locales.get(secondary_language, [])
             secondary_size = (resources[secondary_paths[0]].uncompressed_size
                               if secondary_paths and secondary_paths[0] in resources else 0)
-            counts["estimated_output_bytes"] += (primary_size + secondary_size) * len(_aliases(paths[0]))
+            targets = set(paths)
+            targets.update(
+                alias for path in paths for alias in _aliases(path)
+                if alias not in primary_source_paths
+            )
+            counts["estimated_output_bytes"] += (primary_size + secondary_size) * len(targets)
     report_progress(progress_callback, "Estimated cutscene extraction bytes", 0,
                     counts["estimated_work_bytes"] or None)
 
-    def publish(path: str, staged: Path) -> None:
+    def publish(path: str, staged: Path, *, source_paths: tuple[str, ...] | None = None) -> None:
         normalized = safe_relative_path(path)
         target = root.joinpath(*normalized.split("/"))
         if not target.resolve().is_relative_to(root) or target.exists():
@@ -387,9 +413,28 @@ def build_cutscene_overrides(
         if not target.resolve().is_relative_to(root) or target.exists():
             raise CutsceneGenerationError(f"Unsafe or occupied cutscene output: {path}")
         digest = _hash(staged)
+        origins = set()
+        for source_path in source_paths or (normalized,):
+            source_key = safe_relative_path(source_path)
+            source_entries = candidates.get(source_key, ())
+            if not source_entries:
+                raise CutsceneGenerationError(
+                    f"Generated resource has no verified source-bundle origin: {source_path}"
+                )
+            for source_entry in source_entries:
+                try:
+                    relative_bundle = Path(source_entry.bundle_path).resolve(strict=True).relative_to(game_root)
+                except (OSError, ValueError) as error:
+                    raise CutsceneGenerationError(
+                        f"Cannot resolve source bundle for {source_path}"
+                    ) from error
+                origins.add(safe_relative_path(relative_bundle.as_posix()))
+        if not origins:
+            raise CutsceneGenerationError(f"Generated resource has no source-bundle origin: {path}")
         os.replace(staged, target)
         outputs[normalized] = target
         hashes[normalized] = digest
+        source_bundles[normalized] = tuple(sorted(origins))
         counts["output_bytes"] += target.stat().st_size
 
     def add_cues(path: str, result) -> None:
@@ -413,6 +458,17 @@ def build_cutscene_overrides(
                            _phase(progress_callback, f"Extracting sidecar {path}"))
         return destination.getvalue()
 
+    companion_movie_paths: set[str] = set()
+
+    def copy_companion_movie(path: str, scratch: Path) -> None:
+        """Stage a complete movie when a changed sidecar needs its override anchor."""
+        entry = resources[path]
+        staged = scratch / "companion.usm"
+        with staged.open("wb") as destination:
+            write_bundle_entry(entry.bundle_path, entry, destination,
+                               _phase(progress_callback, f"Staging companion movie {path}"))
+        publish(path, staged, source_paths=(path,))
+
     try:
         with tempfile.TemporaryDirectory(prefix=".cutscene-", dir=root.parent) as temporary:
             scratch = Path(temporary)
@@ -428,7 +484,6 @@ def build_cutscene_overrides(
                     missing = primary_language if primary_language not in locales else secondary_language
                     skipped(stem, missing, "selected locale sidecar is absent")
                     continue
-                # Alias copies must agree before identical overrides can be emitted.
                 primary_paths, secondary_paths = locales[primary_language], locales[secondary_language]
                 if any(resources[path].uncompressed_size > _SIDECAR_LIMIT for path in selected):
                     counts["sidecar_skipped"] += 1
@@ -438,7 +493,7 @@ def build_cutscene_overrides(
                 secondary_data = [sidecar_bytes(path) for path in secondary_paths]
                 if len(set(primary_data)) != 1 or len(set(secondary_data)) != 1:
                     counts["sidecar_skipped"] += 1
-                    skipped(stem, "", "subs/altsubs source texts disagree")
+                    skipped(stem, "", "duplicate sidecar paths for the same variant disagree")
                     continue
                 try:
                     result = merge_subs(primary_data[0], secondary_data[0])
@@ -450,12 +505,27 @@ def build_cutscene_overrides(
                 if result.data == primary_data[0]:
                     counts["sidecar_unchanged"] += 1
                     continue
+                companion_paths = {movie_companion_path(path) for path in primary_paths}
+                if (not companion_paths or None in companion_paths
+                        or any(path not in resources or path in ambiguous
+                               for path in companion_paths)):
+                    counts["sidecar_skipped"] += 1
+                    skipped(primary_paths[0], "",
+                            "matching full .usm movie is missing or ambiguous; sidecar-only overrides are not generated")
+                    continue
                 counts["sidecar_changed"] += 1
-                targets = {alias for path in primary_paths for alias in _aliases(path)}
+                companion_movie_paths.update(companion_paths)
+                alias_sources: dict[str, set[str]] = {}
+                for source_path in primary_paths:
+                    for alias in _aliases(source_path):
+                        if alias != source_path and alias in primary_source_paths:
+                            continue
+                        alias_sources.setdefault(alias, set()).add(source_path)
+                targets = set(alias_sources)
                 for path in sorted(targets):
                     staged = scratch / "sidecar-output"
                     staged.write_bytes(result.data)
-                    publish(path, staged)
+                    publish(path, staged, source_paths=tuple(sorted(alias_sources[path])))
 
             for number, path in enumerate(movies, 1):
                 report_progress(progress_callback, "Processing cutscene USM resources", number, len(movies))
@@ -469,6 +539,8 @@ def build_cutscene_overrides(
                     counts["usm_skipped"] += 1
                     for locale in absent_ids:
                         skipped(path, locale, "selected locale has no confirmed USM locale ID")
+                    if path in companion_movie_paths:
+                        copy_companion_movie(path, scratch)
                     continue
                 source_path, staged = scratch / "source.usm", scratch / "output.usm"
                 try:
@@ -496,11 +568,13 @@ def build_cutscene_overrides(
                     elif result.changed:
                         if staged.stat().st_size != result.bytes_written:
                             raise CutsceneGenerationError(f"USM staged byte count disagrees: {path}")
-                        publish(path, staged)
+                        publish(path, staged, source_paths=(path,))
                         counts["usm_changed"] += 1
                     else:
                         counts["usm_unchanged"] += 1
                 finally:
+                    if path in companion_movie_paths and path not in outputs:
+                        publish(path, source_path, source_paths=(path,))
                     source_path.unlink(missing_ok=True)
                     staged.unlink(missing_ok=True)
         report_progress(progress_callback, "Rechecking cutscene bundle metadata", 0, 1)
@@ -510,8 +584,15 @@ def build_cutscene_overrides(
         if fingerprint_cutscene_bundle_contents(
                 game, progress_callback=progress_callback, phase="Rechecking cutscene bundle contents") != content_fingerprint:
             raise CutsceneGenerationError("Source bundle contents changed during cutscene generation; retry")
-        return CutsceneBuildResult(outputs, hashes, fingerprint,
-                                   CutsceneGenerationSummary(**counts), tuple(rows), content_fingerprint)
+        return CutsceneBuildResult(
+            output_files=outputs,
+            output_hashes=hashes,
+            source_bundles=source_bundles,
+            bundle_fingerprint=fingerprint,
+            summary=CutsceneGenerationSummary(**counts),
+            unmatched_rows=tuple(rows),
+            bundle_content_fingerprint=content_fingerprint,
+        )
     except BaseException:
         for target in outputs.values():
             target.unlink(missing_ok=True)

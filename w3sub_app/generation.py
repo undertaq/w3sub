@@ -20,7 +20,13 @@ from .merge import (
 from .converter import check_compatibility
 from .cutscene_generation import (
     build_cutscene_overrides, fingerprint_cutscene_bundles,
-    fingerprint_cutscene_bundle_contents, safe_relative_path,
+    fingerprint_cutscene_bundle_contents, movie_companion_path, safe_relative_path,
+)
+from .movie_mods import (
+    BACKEND_ID as MOVIE_PACKAGE_BACKEND,
+    BACKEND_VERSION as MOVIE_PACKAGE_BACKEND_VERSION,
+    build_movie_packages,
+    validate_movie_package,
 )
 from .progress import ProgressCallback, report_progress
 from .w3strings_native import NativeW3StringsCodec
@@ -37,7 +43,7 @@ from .models import (
 )
 
 
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.12"
 GENERATION_RECORD_SCHEMA = 2
 
 
@@ -108,20 +114,8 @@ def _pair_resources(game: GameInstallation, primary_language: str,
     ]
 
 
-def _normalize_override_key(raw_key: str) -> str:
-    if not isinstance(raw_key, str) or not raw_key:
-        raise GenerationError("Source override keys must be game-relative resource paths")
-    posix = PurePosixPath(raw_key.replace("\\", "/"))
-    windows = PureWindowsPath(raw_key)
-    if (posix.is_absolute() or windows.is_absolute() or windows.drive
-            or ".." in posix.parts or not posix.parts or "." in posix.parts):
-        raise GenerationError(f"Unsafe source override path: {raw_key!r}")
-    return posix.as_posix()
-
-
 def _source_paths(game: GameInstallation, primary_language: str,
-                  secondary_language: str,
-                  source_overrides: dict[str, Path] | None) -> dict[str, Path]:
+                  secondary_language: str) -> dict[str, Path]:
     root = _normalized_game_root(game.root)
     pairs = _pair_resources(game, primary_language, secondary_language)
     primary_resources = _resource_map(game, primary_language)
@@ -131,22 +125,6 @@ def _source_paths(game: GameInstallation, primary_language: str,
         sources[primary_rel] = primary_resources[primary_rel]
         sources[secondary_rel] = secondary_resources[secondary_rel]
 
-    if source_overrides is not None:
-        overrides = {}
-        for raw_key, raw_path in source_overrides.items():
-            key = _normalize_override_key(raw_key)
-            if key in overrides:
-                raise GenerationError(f"Duplicate source override path: {key}")
-            overrides[key] = Path(raw_path)
-        unexpected = sorted(overrides.keys() - sources.keys())
-        if unexpected:
-            raise GenerationError(
-                f"Source overrides must target selected language resources: {unexpected}"
-            )
-        for relative, source in overrides.items():
-            # The physical backup may live outside the game; its fingerprint
-            # retains the logical game-relative target path.
-            sources[relative] = source
     return sources
 
 
@@ -253,6 +231,14 @@ def _record_payload(record: GenerationRecord) -> dict[str, object]:
         "include_cutscenes": record.include_cutscenes,
         "cutscene_output_files": dict(sorted(record.cutscene_output_files.items())),
         "cutscene_output_hashes": dict(sorted(record.cutscene_output_hashes.items())),
+        "cutscene_source_bundles": {
+            key: list(value) for key, value in sorted(record.cutscene_source_bundles.items())
+        },
+        "cutscene_package_files": dict(sorted(record.cutscene_package_files.items())),
+        "cutscene_package_hashes": dict(sorted(record.cutscene_package_hashes.items())),
+        "cutscene_package_sizes": dict(sorted(record.cutscene_package_sizes.items())),
+        "cutscene_package_backend": record.cutscene_package_backend,
+        "cutscene_package_backend_version": record.cutscene_package_backend_version,
         "cutscene_summary": asdict(record.cutscene_summary),
         "cutscene_bundle_content_fingerprint": (
             _fingerprint_payload(record.cutscene_bundle_content_fingerprint)
@@ -283,8 +269,7 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
         raise GenerationError("Choose two different supported languages")
     root = _normalized_game_root(request.game.root)
     pairs = _pair_resources(request.game, primary_language, secondary_language)
-    sources = _source_paths(request.game, primary_language, secondary_language,
-                            request.source_overrides)
+    sources = _source_paths(request.game, primary_language, secondary_language)
     try:
         initial_fingerprint = _fingerprint_sources(sources, progress_callback)
     except (OSError, ValueError) as error:
@@ -314,6 +299,11 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
     generation_dir.mkdir()
     output_files = {}
     output_hashes = {}
+    cutscene_package_files: dict[str, str] = {}
+    cutscene_package_hashes: dict[str, str] = {}
+    cutscene_package_sizes: dict[str, int] = {}
+    cutscene_package_backend = None
+    cutscene_package_backend_version = None
     merge_stats = MergeStats()
     unmatched_report_rows = []
     published = False
@@ -363,8 +353,6 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
                         primary_csv,
                         secondary_csv,
                         request.mode,
-                        dialogue_index=None,
-                        current_game=request.game,
                         stats=merge_stats,
                         primary_language=primary_language,
                         secondary_language=secondary_language,
@@ -394,6 +382,21 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
             )
             if cutscenes.bundle_fingerprint != initial_bundle_fingerprint:
                 raise GenerationError("Source bundles changed during generation; retry")
+            packages = build_movie_packages(
+                cutscenes.output_files,
+                cutscenes.source_bundles,
+                generation_dir / "movie_packages",
+                progress_callback=progress_callback,
+            )
+            cutscene_package_files = {
+                target: str(path.resolve()) for target, path in packages.files.items()
+            }
+            cutscene_package_hashes = dict(packages.hashes)
+            cutscene_package_sizes = {
+                target: path.stat().st_size for target, path in packages.files.items()
+            }
+            cutscene_package_backend = packages.backend_id
+            cutscene_package_backend_version = packages.backend_version
 
         try:
             final_fingerprint = _fingerprint_sources(
@@ -449,6 +452,13 @@ def generate(request: GenerationRequest, state_root: Path, converter=None, *,
                 {relative: str(path.resolve()) for relative, path in cutscenes.output_files.items()}
                 if cutscenes is not None else {}),
             cutscene_output_hashes=cutscenes.output_hashes if cutscenes is not None else {},
+            cutscene_source_bundles=(
+                cutscenes.source_bundles if cutscenes is not None else {}),
+            cutscene_package_files=cutscene_package_files,
+            cutscene_package_hashes=cutscene_package_hashes,
+            cutscene_package_sizes=cutscene_package_sizes,
+            cutscene_package_backend=cutscene_package_backend,
+            cutscene_package_backend_version=cutscene_package_backend_version,
             cutscene_summary=cutscenes.summary if cutscenes is not None else CutsceneGenerationSummary(),
             cutscene_bundle_fingerprint=initial_bundle_fingerprint,
             cutscene_bundle_content_fingerprint=initial_bundle_content,
@@ -491,6 +501,9 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         raise ValueError("unsupported generation record schema")
     include_cutscenes = False
     cutscene_files, cutscene_hashes = {}, {}
+    cutscene_source_bundles = {}
+    cutscene_package_files, cutscene_package_hashes, cutscene_package_sizes = {}, {}, {}
+    cutscene_package_backend = cutscene_package_backend_version = None
     cutscene_summary = CutsceneGenerationSummary()
     cutscene_fingerprint = None
     cutscene_content_fingerprint = None
@@ -511,6 +524,53 @@ def _record_from_payload(payload: object) -> GenerationRecord:
             if (safe_relative_path(path) != path
                     or PurePosixPath(path).suffix not in (".subs", ".usm")):
                 raise ValueError("generation record cutscene virtual path is unsafe")
+        raw_source_bundles = payload.get("cutscene_source_bundles", {})
+        if (not isinstance(raw_source_bundles, dict)
+                or any(not isinstance(path, str) or not isinstance(origins, list)
+                       or not origins or any(not isinstance(origin, str) for origin in origins)
+                       for path, origins in raw_source_bundles.items())):
+            raise ValueError("generation record cutscene source provenance is malformed")
+        for path, origins in raw_source_bundles.items():
+            if (safe_relative_path(path) != path
+                    or any(safe_relative_path(origin) != origin or not origin.endswith(".bundle")
+                           for origin in origins)
+                    or len({origin.casefold() for origin in origins}) != len(origins)):
+                raise ValueError("generation record cutscene source bundle path is unsafe")
+        cutscene_source_bundles = {
+            path: tuple(origins) for path, origins in raw_source_bundles.items()
+        }
+        raw_package_files = payload.get("cutscene_package_files", {})
+        raw_package_hashes = payload.get("cutscene_package_hashes", {})
+        raw_package_sizes = payload.get("cutscene_package_sizes", {})
+        if (not isinstance(raw_package_files, dict) or not isinstance(raw_package_hashes, dict)
+                or not isinstance(raw_package_sizes, dict)
+                or any(not isinstance(path, str) or not isinstance(value, str)
+                       for path, value in raw_package_files.items())
+                or raw_package_files.keys() != raw_package_hashes.keys()
+                or raw_package_files.keys() != raw_package_sizes.keys()
+                or any(not _is_sha256(value) for value in raw_package_hashes.values())
+                or any(type(value) is not int or value < 0
+                       for value in raw_package_sizes.values())):
+            raise ValueError("generation record movie package inventory is malformed")
+        allowed_package_targets = {
+            "Mods/modW3DualSubtitleManager/content/metadata.store",
+            "Mods/modW3DualSubtitleManager/content/bundles/movies.bundle",
+        }
+        if raw_package_files and set(raw_package_files) != allowed_package_targets:
+            raise ValueError("generation record movie package target paths are malformed")
+        cutscene_package_files = dict(raw_package_files)
+        cutscene_package_hashes = dict(raw_package_hashes)
+        cutscene_package_sizes = dict(raw_package_sizes)
+        cutscene_package_backend = payload.get("cutscene_package_backend")
+        cutscene_package_backend_version = payload.get("cutscene_package_backend_version")
+        if (cutscene_package_backend is not None
+                and (not isinstance(cutscene_package_backend, str) or not cutscene_package_backend)
+                or cutscene_package_backend_version is not None
+                and (not isinstance(cutscene_package_backend_version, str)
+                     or not cutscene_package_backend_version)):
+            raise ValueError("generation record movie package backend is malformed")
+        if raw_package_files and (not cutscene_package_backend or not cutscene_package_backend_version):
+            raise ValueError("generation record movie package backend is missing")
         summary = payload.get("cutscene_summary")
         if (not isinstance(summary, dict)
                 or set(summary) != set(CutsceneGenerationSummary.__dataclass_fields__)
@@ -543,7 +603,10 @@ def _record_from_payload(payload: object) -> GenerationRecord:
                         or any(not _is_sha256(digest) for digest in raw_content["entries"].values())):
                     raise ValueError("generation record bundle content fingerprint is malformed")
                 cutscene_content_fingerprint = ResourceFingerprint(dict(raw_content["entries"]), raw_content["digest"])
-        elif (cutscene_files or cutscene_hashes or raw_fingerprint is not None
+        elif (cutscene_files or cutscene_hashes or cutscene_source_bundles
+              or cutscene_package_files or cutscene_package_hashes or cutscene_package_sizes
+              or cutscene_package_backend is not None or cutscene_package_backend_version is not None
+              or raw_fingerprint is not None
               or payload.get("cutscene_bundle_content_fingerprint") is not None
               or cutscene_summary != CutsceneGenerationSummary()):
             raise ValueError("disabled cutscene generation contains cutscene data")
@@ -632,6 +695,12 @@ def _record_from_payload(payload: object) -> GenerationRecord:
         include_cutscenes=include_cutscenes,
         cutscene_output_files=dict(cutscene_files),
         cutscene_output_hashes=dict(cutscene_hashes),
+        cutscene_source_bundles=dict(cutscene_source_bundles),
+        cutscene_package_files=dict(cutscene_package_files),
+        cutscene_package_hashes=dict(cutscene_package_hashes),
+        cutscene_package_sizes=dict(cutscene_package_sizes),
+        cutscene_package_backend=cutscene_package_backend,
+        cutscene_package_backend_version=cutscene_package_backend_version,
         cutscene_summary=cutscene_summary,
         cutscene_bundle_fingerprint=cutscene_fingerprint,
         cutscene_bundle_content_fingerprint=cutscene_content_fingerprint,
@@ -734,12 +803,7 @@ def _safe_relative_output(relative: str) -> tuple[str, ...] | None:
 def _verify_outputs(record: GenerationRecord, game_root: Path, *,
                     progress_callback: ProgressCallback | None = None,
                     verify_cutscene_hashes: bool = True) -> bool:
-    """Verify all paths and hashes; startup may omit large USM content reads.
-
-    Install callers use the default full verification. Even cheap freshness
-    checks validate every cutscene path, existence and total output size, and
-    hash the small sidecars alongside existing w3strings outputs.
-    """
+    """Verify staged resources and their movie bundle; startup skips huge hashes."""
     expected_outputs = {
         relative
         for relative in record.source_fingerprint.entries
@@ -754,33 +818,63 @@ def _verify_outputs(record: GenerationRecord, game_root: Path, *,
     if generation_dir is None:
         return False
     if (type(record.include_cutscenes) is not bool
-            or record.cutscene_output_files.keys() != record.cutscene_output_hashes.keys()):
+            or record.cutscene_output_files.keys() != record.cutscene_output_hashes.keys()
+            or record.cutscene_package_files.keys() != record.cutscene_package_hashes.keys()
+            or record.cutscene_package_files.keys() != record.cutscene_package_sizes.keys()):
         return False
     if record.include_cutscenes:
         if (record.cutscene_bundle_fingerprint is None
                 or record.cutscene_bundle_content_fingerprint is None
-                or record.cutscene_bundle_content_fingerprint.entries.keys() != record.cutscene_bundle_fingerprint.entries.keys()):
+                or record.cutscene_bundle_content_fingerprint.entries.keys() != record.cutscene_bundle_fingerprint.entries.keys()
+                or record.cutscene_source_bundles.keys() != record.cutscene_output_files.keys()):
             return False
+        if record.cutscene_output_files and set(record.cutscene_package_files) != {
+                "Mods/modW3DualSubtitleManager/content/metadata.store",
+                "Mods/modW3DualSubtitleManager/content/bundles/movies.bundle"}:
+            return False
+        if (record.cutscene_package_files
+                and (record.cutscene_package_backend != MOVIE_PACKAGE_BACKEND
+                     or record.cutscene_package_backend_version != MOVIE_PACKAGE_BACKEND_VERSION)):
+            return False
+        for relative, origins in record.cutscene_source_bundles.items():
+            if (safe_relative_path(relative) != relative or not origins
+                    or any(safe_relative_path(origin) != origin or not origin.endswith(".bundle")
+                           for origin in origins)):
+                return False
     elif (record.cutscene_output_files or record.cutscene_output_hashes
+          or record.cutscene_source_bundles or record.cutscene_package_files
+          or record.cutscene_package_hashes or record.cutscene_package_sizes
+          or record.cutscene_package_backend is not None
+          or record.cutscene_package_backend_version is not None
           or record.cutscene_bundle_fingerprint is not None
           or record.cutscene_bundle_content_fingerprint is not None
           or record.cutscene_summary != CutsceneGenerationSummary()):
         return False
-    total = len(record.output_files) + len(record.cutscene_output_files)
+    total = (len(record.output_files) + len(record.cutscene_output_files)
+             + len(record.cutscene_package_files))
     report_progress(progress_callback, "Checking generated output files", 0, total)
     cutscene_bytes = 0
-    outputs = [(relative, raw_path, record.output_hashes.get(relative), False)
+    outputs = [(relative, raw_path, record.output_hashes.get(relative), "interactive")
                for relative, raw_path in record.output_files.items()]
-    outputs.extend((relative, raw_path, record.cutscene_output_hashes.get(relative), True)
+    outputs.extend((relative, raw_path, record.cutscene_output_hashes.get(relative), "cutscene")
                    for relative, raw_path in record.cutscene_output_files.items())
-    for number, (relative, raw_path, digest, cutscene) in enumerate(outputs, 1):
+    outputs.extend((relative, raw_path, record.cutscene_package_hashes.get(relative), "package")
+                   for relative, raw_path in record.cutscene_package_files.items())
+    actual_packages = {}
+    for number, (relative, raw_path, digest, kind) in enumerate(outputs, 1):
         parts = _safe_relative_output(relative)
         if parts is None or not _is_sha256(digest):
             return False
-        if cutscene and (safe_relative_path(relative) != relative
-                         or PurePosixPath(relative).suffix not in (".subs", ".usm")):
+        if kind == "cutscene" and (safe_relative_path(relative) != relative
+                                    or PurePosixPath(relative).suffix not in (".subs", ".usm")):
             return False
-        expected = (generation_dir / "cutscenes" if cutscene else generation_dir).joinpath(*parts)
+        if kind == "package" and relative not in {
+                "Mods/modW3DualSubtitleManager/content/metadata.store",
+                "Mods/modW3DualSubtitleManager/content/bundles/movies.bundle"}:
+            return False
+        parent = (generation_dir / "cutscenes" if kind == "cutscene" else
+                  generation_dir / "movie_packages" if kind == "package" else generation_dir)
+        expected = parent.joinpath(*parts)
         try:
             actual_path = Path(raw_path)
             if not actual_path.is_absolute():
@@ -793,19 +887,52 @@ def _verify_outputs(record: GenerationRecord, game_root: Path, *,
                 actual.relative_to(generation_dir)
             except ValueError:
                 return False
-            if cutscene:
+            if kind == "cutscene":
                 cutscene_bytes += actual.stat().st_size
-            must_hash = not cutscene or verify_cutscene_hashes or actual.suffix.casefold() != ".usm"
+            if kind == "package":
+                if actual.stat().st_size != record.cutscene_package_sizes[relative]:
+                    return False
+                actual_packages[relative] = actual
+            must_hash = (kind == "interactive"
+                         or (kind == "cutscene"
+                             and (verify_cutscene_hashes or actual.suffix.casefold() != ".usm"))
+                         or (kind == "package"
+                             and (verify_cutscene_hashes or actual.name.casefold() != "movies.bundle")))
             if must_hash and _hash_file(expected) != digest:
                 return False
         except (OSError, ValueError, TypeError, RuntimeError):
             return False
         report_progress(progress_callback, "Checking generated output files", number, total)
-    return cutscene_bytes == record.cutscene_summary.output_bytes
+    if cutscene_bytes != record.cutscene_summary.output_bytes:
+        return False
+    if record.cutscene_output_files:
+        bundle_target = "Mods/modW3DualSubtitleManager/content/bundles/movies.bundle"
+        metadata_target = "Mods/modW3DualSubtitleManager/content/metadata.store"
+        bundle = actual_packages.get(bundle_target)
+        metadata = actual_packages.get(metadata_target)
+        if bundle is None or metadata is None:
+            return False
+        for relative in record.cutscene_output_files:
+            if (PurePosixPath(relative).suffix == ".subs"
+                    and movie_companion_path(relative) not in record.cutscene_output_files):
+                return False
+        if verify_cutscene_hashes:
+            try:
+                report_progress(progress_callback, "Validating packaged movie resources", 0, 1)
+                packaged_resources = validate_movie_package(
+                    bundle, metadata, progress_callback=progress_callback,
+                )
+                if (set(packaged_resources) != set(record.cutscene_output_files)
+                        or any(record.cutscene_output_hashes.get(path) != digest
+                               for path, digest in packaged_resources.items())):
+                    return False
+                report_progress(progress_callback, "Validating packaged movie resources", 1, 1)
+            except (OSError, ValueError, RuntimeError):
+                return False
+    return True
 
 
-def compare_generation(record: GenerationRecord, game: GameInstallation,
-                       source_overrides: dict[str, Path] | None = None, *,
+def compare_generation(record: GenerationRecord, game: GameInstallation, *,
                        progress_callback: ProgressCallback | None = None) -> Freshness:
     """Compare staged inputs and outputs with a freshly scanned install."""
     if _normalized_game_root(record.game_root) != _normalized_game_root(game.root):
@@ -815,8 +942,7 @@ def compare_generation(record: GenerationRecord, game: GameInstallation,
     if record.include_cutscenes and game.version != record.game_version:
         return Freshness.STALE
     try:
-        sources = _source_paths(game, record.primary_language,
-                                 record.secondary_language, source_overrides)
+        sources = _source_paths(game, record.primary_language, record.secondary_language)
         current_fingerprint = _fingerprint_sources(sources, progress_callback)
         if record.include_cutscenes:
             report_progress(progress_callback, "Checking cutscene bundle metadata", 0, 1)

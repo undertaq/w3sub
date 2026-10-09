@@ -34,6 +34,7 @@ _MAX_CUE = 64 * 1024
 _MAX_CUES = 65536
 _MAX_RETAINED = 32 * _BLOCK
 _KINDS = {b"@SFV", b"@SFA", b"@SBT"}
+_CUE_BREAK = "\r"
 _MARKERS = {
     b"#HEADER END     ===============\0",
     b"#METADATA END   ===============\0",
@@ -303,7 +304,7 @@ def _subtitle(source: BinaryIO, chunk: _Chunk) -> _Subtitle:
         text = encoded.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise USMReadError(f"non-UTF-8 subtitle at {chunk.offset}") from exc
-    if "\r" in text or "\n" in text or text.endswith("\0"):
+    if "\n" in text or "\0" in text:
         raise USMReadError(f"unrecognized subtitle line break/terminator at {chunk.offset}")
     return _Subtitle(USMCue(locale, start, start + duration, text, chunk.offset),
                      chunk, data[:20], terminator, unit, text_size)
@@ -489,7 +490,7 @@ def patch_usm_stream(
         matched += 1
         if not partner.cue.text:
             continue
-        encoded = (item.cue.text + "\0" + partner.cue.text).encode("utf-8") + item.terminator
+        encoded = (item.cue.text + _CUE_BREAK + partner.cue.text).encode("utf-8") + item.terminator
         padding = (-(52 + len(encoded))) % 32
         length = 52 + len(encoded) + padding
         # content_xsize and ixsize are verified existing text/chunk capacities.

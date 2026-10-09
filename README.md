@@ -2,6 +2,8 @@
 
 A Windows desktop app for generating and managing a two-language `.w3strings` update for **The Witcher 3: Wild Hunt — Remastered 5.00**.
 
+The window title shows the program build version.
+
 ## Requirements and launch
 
 - Windows. The standalone executable includes Python and Tkinter; no separate Python installation is required.
@@ -30,7 +32,7 @@ python -m pip install -r requirements-build.txt
 .\build.ps1
 ```
 
-The output is `dist/W3DualSubtitleManager.exe`. The build includes the app, Python/Tk runtime, built-in codec, and its license and notice. Game resources, user data/backups, the WolvenKit helper, and optional external converters are excluded. Custom converters remain external executables selected at runtime with **Browse**. Configuration, logs, and recovery data continue to use the per-user application-data folder described below.
+The output is `dist/W3DualSubtitleManager.exe`. The build includes the app, Python/Tk runtime, built-in codec, and its license and notice. Game resources, per-user data, and optional external converters are excluded. Custom converters remain external executables selected at runtime with **Browse**. Configuration, logs, and generation data continue to use the per-user application-data folder described below.
 
 ## Select and scan the game
 
@@ -60,33 +62,33 @@ Choose **Generate preview** to run compatibility validation and generate the pre
 
 ### Cutscene subtitles (`.subs` and `.usm`)
 
-**Include cutscene subtitles** is on by default. Clear it before generating a preview to produce only interactive `.w3strings` files. When enabled, the app scans active game bundles for `.subs` sidecars and `.usm` movies. It stages only changed subtitle resources. Sidecars are paired by movie name and locale suffix; where the game has both `subs` and `altsubs` copies, their input text must agree before both aliases are emitted.
+**Include cutscene subtitles** is on by default. Clear it before generating a preview to produce only interactive `.w3strings` files. When enabled, the app scans active game bundles for `.subs` sidecars and `.usm` movies. Changed sidecars and their full companion `.usm` files are packed together into one `movies.bundle` with a matching `metadata.store`; the game requires the full movie alongside the sidecar override. Sidecars are paired by movie name, playback folder (`subs` or `altsubs`), and locale suffix. The two playback folders are processed independently because their cue text and counts can differ; an alias is emitted only when the corresponding primary-language resource is absent.
 
 Cues are paired only when their start and end times match exactly. Duplicate timing pairs are matched one-to-one in source order. A cue without a partner stays in the primary language; unmatched cues from either language and resources that could not be processed are listed in that generation's `cutscene_unmatched.csv`. The preview's **Cutscene unmatched CSV** button opens the report. It includes resource, locale, cue times, text, and a reason for unmatched cues or skipped resources.
 
 For embedded USM tracks, locale IDs have been confirmed for `en`, `pl`, `de`, `it`, `fr`, `cz`, `es`, `zh`, `ru`, `cn`, `jp`, `kr`, `br`, `esmx`, and `ar`. Selected locale codes without a confirmed USM locale ID, including `hu`, `tr`, and `ua`, are skipped and reported; unselected numeric locale tracks are preserved. Unsupported USM chunk/table layouts, multiple subtitle streams, unverified timing profiles, or merged text exceeding the movie's existing subtitle capacity are also reported as skips. Sidecars are skipped if a selected locale is missing, the copies disagree, the file exceeds the 16 MiB parsing limit, or its encoding/rows do not match the recognized CRI format. Bundle integrity or extraction failures stop generation instead of publishing a partial preview.
 
-The merged second line uses the CRI subtitle format's native NUL (`U+0000`) line break inside cue text. `.subs` row boundaries remain CRLF. The app does not insert HTML `<br>` markup into cutscene files. Embedded USM patching preserves the original cue's locale and timing, and updates only validated subtitle bytes, container sizes, padding, and video seek offsets.
+The second language follows the primary text after a carriage return (`U+000D`) inside `.subs` sidecar cues. Cue records remain CRLF-delimited. Embedded USM subtitle cues use the same carriage-return line break, confirmed in the recap movie. The app does not insert HTML `<br>` markup into cutscene files. Embedded USM patching preserves the original cue's locale and timing, and updates only validated subtitle bytes, container sizes, padding, and video seek offsets.
 
-Cutscene generation hashes bundle indexes and the contents of bundles that contain candidate cutscene resources. Startup freshness checks use bundle metadata for a fast scan; generation reports byte progress while hashing and processing resources, and Install rechecks the source content before changing files. This can read several GB and take a while. The preview reports estimated scan/work bytes and estimated output bytes; after generation it also reports actual staged output bytes and cue match counts. The estimate may include resources later skipped. Staged output in application data and the installed Mods copy coexist, so budget about twice the actual output size while an install is active, plus temporary extraction and transaction space. Exact disk use depends on the selected languages and the resources that change.
+Cutscene generation hashes bundle indexes and the contents of bundles that contain candidate cutscene resources. Startup freshness checks use bundle metadata for a fast scan; generation reports byte progress while hashing and processing resources, and Install rechecks the source content before changing files. This can read several GB and take a while. The preview reports estimated scan/work bytes, the actual `movies.bundle` package size, and cue match counts. Movie resources and subtitle sidecars remain uncompressed in the generated bundle to match the shipped movie-bundle layout. Full movie files are large: the 5.00 installation used for development contains about 7.2 GiB of unique USM video payloads, while the selected-language package can be smaller. Generated outputs, temporary bundle creation, install staging, and the installed Mods copy need additional space; the exact package size appears in the preview.
 
-Cutscene format support was checked against the installed 5.00 resources, but subtitle playback has not been verified in game. For the observed zh+cn set, 27 of 30 subtitle-bearing USMs met the current static layout, timing, and capacity checks; two exceed verified subtitle capacities, and one has an unverified nonzero timing-header value. Other language pairs can have different capacity skips. The live preview report shows the result for the selected game and languages.
+The opening recap was verified in game with its modified `.subs` and full `.usm` packaged together: both languages displayed on separate lines. Other cutscenes and language pairs still need in-game checks. For the observed zh+cn set, 27 of 30 subtitle-bearing USMs met the current static layout, timing, and capacity checks; two exceed verified subtitle capacities, and one has an unverified nonzero timing-header value. Other language pairs can have different capacity skips. The live preview report shows the result for the selected game and languages.
 
 ## Install, modify, and uninstall
 
-- **Install** backs up each original interactive `.w3strings` target and saves its SHA-256 hash, then installs the reviewed output after an explicit confirmation. Cutscene outputs go under the dedicated `Mods/modW3DualSubtitleManager/content/<virtual path>` tree; the app does not rewrite the game's bundle files.
-- **Modify install** generates the new pair from original `.w3strings` backups for any already-managed input resources. If a language changes from primary to secondary, its original file is used instead of the currently merged game file. Interactive files no longer targeted by the new pair are restored from their backups. Cutscene overrides are added, replaced, or removed to match the new preview.
-- **Uninstall** restores interactive originals only when each managed game file still matches the hash saved for the installed version, and removes cutscene overrides only when they still match the installed hashes. Original `.w3strings` backups are retained after uninstall.
+- **Install** writes interactive `.w3strings` plus `content/bundles/movies.bundle` and `content/metadata.store` under `Mods/modW3DualSubtitleManager`. The game's base `content` and `DLC` files remain untouched. The manager checks that each target is new or already belongs to its active install before writing it.
+- **Modify install** updates the manager-mod overrides to match the new preview. Generation reads the unchanged base-game string resources.
+- **Uninstall** removes manager-mod files only when they still match the installed hashes. The base game files are left untouched.
 
 The app checks for a running Witcher 3 process before changing game files. It stores the game version and source-resource fingerprints at generation and install time, then compares them at startup and after a folder change. If source resources change after a game update, the preview is stale and must be regenerated. If an active install is stale, uninstall it safely before generating a replacement. A version metadata change with unchanged source resources is tracked separately from changed resource contents.
 
-Historical generation records and install manifests remain readable. A legacy classifier digest does not affect freshness or safe uninstall; restoration uses the saved target hashes and validated original backups.
+Historical generation records and manager-mod install manifests remain readable. A legacy classifier digest does not affect freshness or safe uninstall. Direct game-file installs are not managed by this version; restore those files through the game's storefront before using the manager.
 
-If a managed file or backup no longer matches its saved hash, or the dedicated Mods folder contains files the manager does not own, the app reports the exact conflict paths and backup location and preserves the unexpected data. It will not overwrite or delete conflicting files during Modify or Uninstall. Resolve the conflict manually, using the retained originals under the backup directory if recovery is needed, then rescan the game.
+If a managed file no longer matches its saved hash, or the dedicated Mods folder contains files the manager does not own, the app reports the exact conflict paths and preserves the unexpected data. It will not overwrite or delete conflicting files during Modify or Uninstall. Resolve the conflict manually, then rescan the game.
 
 ## App data and recovery files
 
-On Windows, configuration, logs, generation records, staged outputs, manifests, and backups are stored under:
+On Windows, configuration, logs, generation records, staged outputs, and manifests are stored under:
 
 ```text
 %LOCALAPPDATA%\W3DualSubtitle\
@@ -98,8 +100,6 @@ The selected game path is saved in `config.json`. Per-game state is keyed by the
 %LOCALAPPDATA%\W3DualSubtitle\games\<game-path-hash>\
 ```
 
-Original install backups are kept under that per-game state folder in `backups\<install-id>\`. Keep this directory until you no longer need uninstall or manual recovery.
-
 ## Testing and live-game safety
 
-The automated workflow test creates a disposable copy of a minimal game fixture under a temporary directory. It never runs install, modify, or uninstall against the live F: game folder. For normal GUI use, the app changes live game resources only after you explicitly confirm **Install** or **Modify**; **Uninstall** also requires its own confirmation.
+The automated workflow test creates a disposable copy of a minimal game fixture under a temporary directory. It never runs install, modify, or uninstall against a live game folder. For normal GUI use, the app changes manager-mod files only after you explicitly confirm **Install** or **Modify**; **Uninstall** also requires its own confirmation.

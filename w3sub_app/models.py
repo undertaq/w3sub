@@ -58,7 +58,6 @@ class GenerationRequest:
     primary_language: str
     secondary_language: str
     mode: MergeMode
-    source_overrides: dict[str, Path] | None = None
     include_cutscenes: bool = True
 
 
@@ -120,6 +119,12 @@ class GenerationRecord:
     include_cutscenes: bool = False
     cutscene_output_files: dict[str, str] = field(default_factory=dict)
     cutscene_output_hashes: dict[str, str] = field(default_factory=dict)
+    cutscene_source_bundles: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    cutscene_package_files: dict[str, str] = field(default_factory=dict)
+    cutscene_package_hashes: dict[str, str] = field(default_factory=dict)
+    cutscene_package_sizes: dict[str, int] = field(default_factory=dict)
+    cutscene_package_backend: str | None = None
+    cutscene_package_backend_version: str | None = None
     cutscene_summary: CutsceneGenerationSummary = field(default_factory=CutsceneGenerationSummary)
     cutscene_bundle_fingerprint: ResourceFingerprint | None = None
     cutscene_bundle_content_fingerprint: ResourceFingerprint | None = None
@@ -138,10 +143,7 @@ class GenerationProvenance:
 @dataclass(frozen=True)
 class InstallTarget:
     relative_path: str
-    backup_path: Path | None
-    original_sha256: str | None
     installed_sha256: str
-    original_exists: bool = True
 
 
 @dataclass(frozen=True)
@@ -150,7 +152,6 @@ class InstallManifest:
     install_id: str
     game_root: Path
     state_directory: Path
-    backup_directory: Path
     storefront: Storefront
     store_build_id: str | None
     generation_id: str
@@ -184,8 +185,7 @@ class InstallComparison:
 
 @dataclass(frozen=True)
 class UninstallResult:
-    restored_paths: tuple[str, ...]
-    backup_directory: Path
+    removed_paths: tuple[str, ...]
     conflicts: tuple[str, ...] = ()
     rollback_errors: tuple[str, ...] = ()
     error: str | None = None

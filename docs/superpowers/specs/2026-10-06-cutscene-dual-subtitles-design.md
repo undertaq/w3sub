@@ -42,7 +42,7 @@ Parse the shipped sidecar form as UTF-16LE with BOM and CRLF records. Preserve t
 
 Pair language files by virtual resource stem and cue by the exact `(start, end)` time pair. Merge only exact timing matches. Keep a primary cue unchanged when no secondary cue matches it, and do not append secondary-only cues with no primary timing anchor. Record all unmatched primary and secondary cues with resource path, language, cue times, text, and reason in a cutscene debug CSV.
 
-Where the same sidecar resource is used through `subs` and `altsubs` playback paths, emit identical managed overrides for both paths. Do not duplicate an override when the source inventory already contains the equivalent logical path.
+Treat `subs` and `altsubs` as separate sidecar resources. Their cue text and cue counts can differ even when they reference the same movie, so pair each playback folder independently by locale and timing. Emit a counterpart alias only when that primary-language resource is absent from the source inventory.
 
 ### 3. Patch embedded USM subtitles
 
@@ -52,7 +52,7 @@ Patch the existing primary-locale `@SBT` cue text in place logically: rebuild on
 
 Use the game's locale mapping for USM language IDs. The inspected `fb_1a.usm` sample maps Traditional Chinese `zh` to locale ID 7 and Simplified Chinese `cn` to ID 9. Treat the mapping as explicit data, not as an assumption based on language ordering. If a selected locale is absent from a video, leave that video unchanged and report it.
 
-For dual text, place the primary text first and the secondary text after a native line break. Do not write HTML such as `<br>` into either format. USM subtitle payloads must use CRI's line-break representation; sidecar serialization must preserve cue-row boundaries while representing a line break in cue text.
+For dual text, place the primary text first. Embedded USM cues and `.subs` sidecar cue text use the user-verified carriage return (`U+000D`) line break; `.subs` cue records themselves remain delimited by CRLF. The first sidecar line-break trial was inconclusive because the generated bundle compressed `.subs` entries unlike the uncompressed shipped `st_1` sidecars. Once the bundle preserved uncompressed sidecars, the game displayed the merged text, so use the native CR line break in sidecars as well. Do not write HTML such as `<br>` into either format.
 
 ### 4. Stage and preview output
 

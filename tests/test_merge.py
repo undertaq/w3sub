@@ -2,80 +2,36 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from w3sub_app.dialogue_index import DialogContext, DialogueIndex
 from w3sub_app.merge import MergeError, merge_csv, merge_records
-from w3sub_app.models import GameInstallation, GameVersion, MergeMode, Storefront
+from w3sub_app.models import MergeMode
 from w3sub_app.w3strings_native import StringsFile
 
-
 class NativeMergeTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="native merge ")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.game = GameInstallation(self.root, Storefront.STEAM, GameVersion("5.0.0", None), {})
-        self.source = self.root / "refs" / "scene.json"
-        self.source.parent.mkdir()
-        self.source.write_text("controlled reference inventory", encoding="utf-8")
-
-    def index(self, id_contexts):
-        # Production indexes aggregate all key and keyless contexts for an ID.
-        return DialogueIndex.from_validated_references(
-            self.game, [self.source],
-            {(str(string_id), "0"): contexts for string_id, contexts in id_contexts.items()},
-            source_roots=[self.source.parent], source_patterns=["scene*.json"])
-
     def test_keyless_shared_spoken_id_merges_by_id(self):
         primary = StringsFile(164, 17, ((9, "ZH\r\n台詞"), (1, "only primary")), ((99, 90),))
         secondary = StringsFile(164, 23, ((9, "EN\nline"), (2, "only secondary")), ())
-        index = self.index({9: [DialogContext.SCENE_SUBTITLE], 1: [DialogContext.SCENE_SUBTITLE]})
-        result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game)
+        result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY)
         self.assertEqual(result.strings, ((9, "ZH\r\n台詞<br>EN\nline"), (1, "only primary")))
         self.assertEqual(result.keys, ((99, 90),))
         self.assertEqual((result.version, result.language_key), (164, 17))
         self.assertEqual(merge_records(primary, secondary, MergeMode.FULL_TEXT), primary)
 
-    def test_keyless_choice_other_unknown_and_ambiguous_ids_stay_primary(self):
-        primary = StringsFile(164, 0, ((1, "spoken"), (2, "choice"), (3, "item"),
-                                     (4, "unknown"), (5, "mixed")), ())
-        secondary = StringsFile(164, 0, ((1, "spoken EN"), (2, "choice EN"), (3, "item EN"),
-                                       (4, "unknown EN"), (5, "mixed EN")), ())
-        index = self.index({1: [DialogContext.SCENE_SUBTITLE], 2: [DialogContext.CHOICE_UI],
-                            3: [DialogContext.OTHER],
-                            5: [DialogContext.SCENE_SUBTITLE, DialogContext.HUD_UI]})
-        result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game)
-        self.assertEqual(result.strings, ((1, "spoken<br>spoken EN"), (2, "choice"), (3, "item"),
-                                         (4, "unknown"), (5, "mixed")))
-        self.assertEqual(result.keys, ())
-
     def test_keyless_fallback_requires_both_language_key_sets_empty(self):
-        index = self.index({1: [DialogContext.SCENE_SUBTITLE]})
         for primary_keys, secondary_keys, expected in (
                 ((), (), "ZH<br>EN"), (((0, 1),), (), "ZH"),
                 ((), ((0, 1),), "ZH"), (((7, 1),), ((8, 1),), "ZH")):
             with self.subTest(primary_keys=primary_keys, secondary_keys=secondary_keys):
                 primary = StringsFile(164, 0, ((1, "ZH"),), primary_keys)
                 secondary = StringsFile(164, 0, ((1, "EN"),), secondary_keys)
-                result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game)
+                result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY)
                 self.assertEqual(result.strings, ((1, expected),))
                 self.assertEqual(result.keys, primary_keys)
         primary = StringsFile(164, 0, ((1, "ZH"),), ())
         missing = StringsFile(164, 0, ((2, "EN"),), ())
-        self.assertEqual(merge_records(primary, missing, MergeMode.DIALOGUE_ONLY, index, self.game), primary)
-        self.source.write_text("changed reference inventory", encoding="utf-8")
+        self.assertEqual(merge_records(primary, missing, MergeMode.DIALOGUE_ONLY), primary)
         secondary = StringsFile(164, 0, ((1, "EN"),), ())
-        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game), primary)
-
-    def test_keyed_records_still_require_shared_key_and_exclusive_scene_context(self):
-        primary = StringsFile(164, 0, ((1, "spoken"), (2, "different key"), (3, "mixed")),
-                              ((7, 1), (8, 1), (9, 2), (10, 3)))
-        secondary = StringsFile(164, 0, ((1, "spoken EN"), (2, "different EN"), (3, "mixed EN")),
-                                ((8, 1), (11, 2), (10, 3)))
-        index = self.index({1: [DialogContext.SCENE_SUBTITLE], 2: [DialogContext.SCENE_SUBTITLE],
-                            3: [DialogContext.SCENE_SUBTITLE, DialogContext.ITEM]})
-        result = merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, index, self.game)
-        self.assertEqual(result.strings, ((1, "spoken<br>spoken EN"), (2, "different key"), (3, "mixed")))
-        self.assertEqual(result.keys, ((7, 1), (8, 1), (9, 2), (10, 3)))
+        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY).strings,
+                         ((1, "ZH<br>EN"),))
 
     def test_matches_shared_real_keys_and_preserves_all_primary_associations(self):
         from w3sub_app.merge import merge_records
@@ -91,26 +47,6 @@ class NativeMergeTests(unittest.TestCase):
         self.assertEqual(result.language_key, 0)
         self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY), primary)
 
-    def test_dialogue_mode_requires_all_primary_associations_to_be_scene_subtitles(self):
-        from w3sub_app.merge import merge_records
-        from w3sub_app.w3strings_native import StringsFile
-        game = GameInstallation(Path("game"), Storefront.STEAM, GameVersion("5.0", None), {})
-        class Index:
-            validated = True
-            def is_current(self, current):
-                return current == game
-            def context_for(self, string_id, key):
-                return DialogContext.SCENE_SUBTITLE if key == "a" else DialogContext.UNKNOWN
-            def context_for_id(self, string_id):
-                return DialogContext.SCENE_SUBTITLE
-        primary = StringsFile(164, 0, ((1, "text"),), ((10, 1), (11, 1)))
-        secondary = StringsFile(164, 0, ((1, "other"),), ((10, 1),))
-        self.assertEqual(merge_records(primary, secondary, MergeMode.DIALOGUE_ONLY, Index(), game), primary)
-        single = StringsFile(164, 0, primary.strings, ((10, 1),))
-        self.assertEqual(merge_records(single, secondary, MergeMode.DIALOGUE_ONLY, Index(), game).strings,
-                         ((1, "text<br>other"),))
-
-
 class MergeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="merge space ")
@@ -123,29 +59,18 @@ class MergeTests(unittest.TestCase):
         self.primary.write_text(primary, encoding="utf-8", newline="")
         self.secondary.write_text(secondary, encoding="utf-8", newline="")
 
-    def test_external_csv_never_uses_keyless_fallback(self):
-        source = self.root / "refs" / "scene.json"
-        source.parent.mkdir()
-        source.write_text("controlled reference inventory", encoding="utf-8")
-        game = GameInstallation(self.root, Storefront.STEAM, GameVersion("5.0.0", None), {})
-        index = DialogueIndex.from_validated_references(
-            game, [source], {("1", "1"): [DialogContext.SCENE_SUBTITLE]},
-            source_roots=[source.parent], source_patterns=["scene*.json"])
+    def test_dialogue_only_csv_requires_shared_key_hash(self):
         original = "; primary\r\nid|key(hex)|key(str)|text\r\n1|00000001||ZH\r\n"
         self.write_pair(original, "1|00000002||EN\n")
-        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY, index, game)
+        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY)
         with result.open(encoding="utf-8", newline="") as output:
             self.assertEqual(output.read(), original)
-        for mode in MergeMode:
-            self.write_pair("1|||ZH\n", "1|||EN\n")
-            with self.assertRaises(MergeError):
-                merge_csv(self.primary, self.secondary, mode, index, game)
 
     def test_full_text_preserves_metadata_order_key_and_pipe_text(self):
         primary = "; language en\r\nid|key(hex)|key(str)|text\r\n2|00000002|named|A|B<br>C\r\n; between\r\n1|00000001||first\r\n3|00000003||only primary\r\n1|00000004||different key\r\n"
         self.write_pair(primary,
                         "; zh\n1|00000001||一\n2|00000002|other|甲|乙<br>丙\n9|00000009||only secondary\n")
-        result = merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT, None)
+        result = merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT)
         with result.open(encoding="utf-8", newline="") as handle:
             self.assertEqual(handle.read(), "; language en\r\nid|key(hex)|key(str)|text\r\n2|00000002|named|A|B<br>C<br>甲|乙<br>丙\r\n; between\r\n1|00000001||first<br>一\r\n3|00000003||only primary\r\n1|00000004||different key\r\n")
         with self.primary.open(encoding="utf-8", newline="") as handle:
@@ -161,111 +86,22 @@ class MergeTests(unittest.TestCase):
                     self.write_pair(bad if side == "primary" else valid,
                                     bad if side == "secondary" else valid)
                     with self.assertRaises(MergeError):
-                        merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT, None)
+                        merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT)
 
     def test_empty_text_and_final_record_without_newline(self):
         self.write_pair("; en\n1|00000001||", "; zh\n1|00000001||other")
-        result = merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT, None)
+        result = merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT)
         self.assertEqual(result.read_text(encoding="utf-8"), "; en\n1|00000001||<br>other")
 
-    def test_dialogue_only_without_index_preserves_primary_rows(self):
+    def test_dialogue_only_preserves_keyed_csv_rows(self):
         self.write_pair("1|00000001||one\n", "1|00000001||two\n")
-        for index in (None, object()):
-            result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY, index)
-            self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||one\n")
-
-    def test_dialogue_only_merges_scene_rows_and_preserves_other_contexts(self):
-        self.write_pair(
-            "1|00000001||scene\n2|00000002||overhead\n3|00000003||item\n"
-            "4|00000004||objective\n5|00000005||ambiguous\n6|00000006||hud\n"
-            "7|00000007||other\n8|00000008||unknown\n",
-            "1|00000001||scene-alt\n2|00000002||overhead-alt\n3|00000003||item-alt\n"
-            "4|00000004||objective-alt\n5|00000005||ambiguous-alt\n6|00000006||hud-alt\n"
-            "7|00000007||other-alt\n8|00000008||unknown-alt\n",
-        )
-        source = self.root / "structured" / "scene-references.json"
-        source.parent.mkdir()
-        source.write_text('{"fixture": true}\n', encoding="utf-8")
-        game = GameInstallation(
-            self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
-        )
-        index = DialogueIndex.from_validated_references(game, [source], {
-            ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-            ("2", "00000002"): [DialogContext.OVERHEAD],
-            ("3", "00000003"): [DialogContext.ITEM],
-            ("4", "00000004"): [DialogContext.OBJECTIVE],
-            ("5", "00000005"): [DialogContext.SCENE_SUBTITLE, DialogContext.OVERHEAD],
-            ("6", "00000006"): [DialogContext.HUD_UI],
-            ("7", "00000007"): [DialogContext.OTHER],
-        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
-
-        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
-                           index, current_game=game)
-
-        self.assertEqual(
-            result.read_text(encoding="utf-8"),
-            "1|00000001||scene<br>scene-alt\n2|00000002||overhead\n"
-            "3|00000003||item\n4|00000004||objective\n5|00000005||ambiguous\n"
-            "6|00000006||hud\n7|00000007||other\n8|00000008||unknown\n",
-        )
-
-    def test_stale_index_preserves_all_primary_rows(self):
-        self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
-        source = self.root / "structured" / "scene-references.json"
-        source.parent.mkdir()
-        source.write_text("original source\n", encoding="utf-8")
-        game = GameInstallation(
-            self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
-        )
-        index = DialogueIndex.from_validated_references(game, [source], {
-            ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
-        source.write_text("changed source\n", encoding="utf-8")
-
-        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
-                           index, current_game=game)
-
-        self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||primary\n")
-
-    def test_index_without_current_game_preserves_primary_rows(self):
-        self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
-        source = self.root / "structured" / "scene-references.json"
-        source.parent.mkdir()
-        source.write_text("unchanged source\n", encoding="utf-8")
-        game = GameInstallation(
-            self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
-        )
-        index = DialogueIndex.from_validated_references(game, [source], {
-            ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
-
-        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY, index)
-
-        self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||primary\n")
-
-    def test_added_reference_file_makes_dialogue_index_stale(self):
-        self.write_pair("1|00000001||primary\n", "1|00000001||secondary\n")
-        source = self.root / "structured" / "scene-references.json"
-        source.parent.mkdir()
-        source.write_text("scene reference\n", encoding="utf-8")
-        game = GameInstallation(
-            self.root, Storefront.STEAM, GameVersion("5.0.0.1044392", "fixture", None), {}
-        )
-        index = DialogueIndex.from_validated_references(game, [source], {
-            ("1", "00000001"): [DialogContext.SCENE_SUBTITLE],
-        }, source_roots=[source.parent], source_patterns=["scene-*.json"])
-        added_reference = source.parent / "scene-references-extra.json"
-        added_reference.write_text("same ID also used for an item\n", encoding="utf-8")
-
-        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY,
-                           index, current_game=game)
-
-        self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||primary\n")
+        result = merge_csv(self.primary, self.secondary, MergeMode.DIALOGUE_ONLY)
+        self.assertEqual(result.read_text(encoding="utf-8"), "1|00000001||one\n")
 
     def test_bad_mode_or_unreadable_input_is_merge_error(self):
         self.write_pair("1|00000001||one\n", "1|00000001||two\n")
         with self.assertRaises(MergeError):
-            merge_csv(self.primary, self.secondary, "unknown", None)
+            merge_csv(self.primary, self.secondary, "unknown")
         self.secondary.unlink()
         with self.assertRaises(MergeError):
-            merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT, None)
+            merge_csv(self.primary, self.secondary, MergeMode.FULL_TEXT)

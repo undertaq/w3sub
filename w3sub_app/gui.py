@@ -11,7 +11,7 @@ from typing import Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import config, generation, install, storefronts
+from . import BUILD_VERSION, config, generation, install, storefronts
 from .converter import W3StringsConverter
 from .w3strings_native import NativeW3StringsCodec
 from .progress import ProgressCallback, ProgressUpdate, report_progress
@@ -93,15 +93,16 @@ def _cutscene_summary_text(record: GenerationRecord) -> str:
         f"unmatched cues: {summary.unmatched_count:,}; "
         f"estimated scan/work: {_format_bytes(summary.estimated_work_bytes)}; "
         f"estimated output: {_format_bytes(summary.estimated_output_bytes)}; "
+        f"movie bundle package: {_format_bytes(sum(record.cutscene_package_sizes.values()))}; "
+        "extra working space is needed during generation and installation; "
         f"actual output: {_format_bytes(summary.output_bytes)}"
     )
 
 
 def _generation_install_relative_paths(record: GenerationRecord) -> set[str]:
     """Return every output path using the same relative names as the install manifest."""
-    targets = set(record.output_files)
-    targets.update(f"{install.MOD_CONTENT}/{relative}"
-                   for relative in record.cutscene_output_files)
+    targets = {install.mod_resource_target(relative) for relative in record.output_files}
+    targets.update(record.cutscene_package_files)
     return targets
 
 
@@ -117,6 +118,8 @@ def _progress_phase_text(update: ProgressUpdate) -> str:
         ("Scanning cutscene bundle tables", "Finding cutscene resources"),
         ("Merging cutscene sidecar resources", "Merging cutscene subtitle files"),
         ("Processing cutscene USM resources", "Processing cutscene videos"),
+        ("movie-package-bytes", "Building cutscene movie bundle"),
+        ("Validating movie bundle payloads", "Checking movie bundle contents"),
         ("Rechecking cutscene bundle metadata", "Rechecking cutscene bundle indexes"),
     )
     for marker, label in labels:
@@ -227,20 +230,6 @@ def default_language_pair(languages: tuple[str, ...], primary: str = "",
     return primary, secondary
 
 
-def source_overrides_for_pair(game: GameInstallation, manifest: InstallManifest | None,
-                              primary: str, secondary: str) -> dict[str, Path]:
-    """Use validated originals for every selected resource managed by Modify."""
-    if manifest is None or not manifest.active:
-        return {}
-    sources = generation._source_paths(game, primary, secondary, None)
-    overrides = {}
-    for relative in sorted(sources):
-        target = manifest.target_files.get(relative)
-        if target is not None:
-            overrides[relative] = install._validate_backup(manifest, relative, target)
-    return overrides
-
-
 def build_action_state(*, has_game: bool, primary: str | None, secondary: str | None,
                        mode: MergeMode, resources_available: bool,
                        codec_available: bool, generated: bool,
@@ -290,26 +279,21 @@ def default_converter_path() -> Path:
 
 
 def confirmation_text(operation: str, game_root: Path, primary: str, secondary: str,
-                      target_paths: tuple[str, ...], backup_directory: Path | None = None) -> str:
-    action = "Restore" if operation.casefold() == "uninstall" else operation
+                      target_paths: tuple[str, ...]) -> str:
+    action = operation
     lines = [f"{action} {primary} + {secondary} for this game folder?", str(game_root), "",
              "Exact target files:"]
     lines.extend(f"  {path}" for path in sorted(target_paths))
-    if backup_directory is not None:
-        lines.extend(("", f"Original backups: {backup_directory}"))
     return "\n".join(lines)
 
 
-def completed_paths_text(game_root: Path, relative_paths: tuple[str, ...],
-                         backup_directory: Path | None) -> str:
+def completed_paths_text(game_root: Path, relative_paths: tuple[str, ...]) -> str:
     targets = sorted(str(Path(game_root).joinpath(*Path(relative).parts))
                      for relative in relative_paths)
     lines = ["Completed paths:"]
     lines.extend(f"  {target}" for target in targets)
     if not targets:
         lines.append("  (none)")
-    if backup_directory is not None:
-        lines.extend(("", f"Original backups remain at {backup_directory}"))
     return "\n".join(lines)
 
 
@@ -396,13 +380,11 @@ def show_scrollable_dialog(parent: tk.Misc, title: str, text: str,
 
 
 def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
-    """Identify the active install targets and backups shown in a confirmation."""
+    """Identify the active manager-mod targets shown in a confirmation."""
     targets = tuple(sorted(
         (
             relative,
             target.relative_path,
-            _path_identity(target.backup_path),
-            target.original_sha256,
             target.installed_sha256,
         )
         for relative, target in manifest.target_files.items()
@@ -410,7 +392,6 @@ def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
     return (
         _path_identity(manifest.game_root),
         _path_identity(manifest.state_directory),
-        _path_identity(manifest.backup_directory),
         manifest.storefront,
         manifest.store_build_id,
         manifest.install_id,
@@ -497,7 +478,8 @@ class W3DualSubtitleApp:
         self.codec_available = False
         self._allow_game_value_event = False
         self._build_widgets()
-        self.root.title("Witcher 3 Dual Subtitle Manager")
+        self._update_cutscene_space_note()
+        self.root.title(f"Witcher 3 Dual Subtitle Manager v{BUILD_VERSION}")
         self.root.geometry("900x620")
         self.root.minsize(760, 560)
         self.root.resizable(True, True)
@@ -574,6 +556,13 @@ class W3DualSubtitleApp:
             command=self._cutscene_option_changed,
         )
         self.include_cutscenes_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.cutscene_space_var = tk.StringVar(
+            value="Full movie files are included in the mod bundle. The tested 5.00 install has "
+                  "about 7.2 GiB of movie data; your package can be smaller. The preview shows "
+                  "the exact package size. Keep extra space for generated and installed copies."
+        )
+        ttk.Label(mode, textvariable=self.cutscene_space_var, wraplength=780).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         actions = ttk.Frame(frame)
         actions.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(5, 7))
@@ -634,22 +623,22 @@ class W3DualSubtitleApp:
             (self.converter_entry, "The built-in codec is the default. Browse to choose an external converter."),
             (self.converter_button, "Choose an external w3strings converter override; generation checks compatibility."),
             (self.native_codec_button, "Return to the built-in codec; no external executable is needed."),
-            (self.primary_combo, "Choose the first language in merged text and the game language resources to replace."),
+            (self.primary_combo, "Choose the language shown first; generated string files are installed as manager-mod overrides."),
             (self.secondary_combo, "Choose a different language to append to matching primary entries."),
             (self.dialogue_mode, "Merge matching string IDs with no key hash in either language; keyed entries stay unchanged."),
             (self.full_mode, "Merge all matching entries, including keyed text such as menus and descriptions."),
             (self.include_cutscenes_check,
-             "Scan game bundles for .subs and .usm subtitles. This can read several GB and take a while; the preview estimates scan work and output size. Staged outputs plus the installed Mods copy can use about twice the output estimate, plus temporary space. Cutscene text keeps native NUL line breaks. Clear this option to skip cutscenes."),
+             "Cutscene mods include complete .usm movie files together with their .subs sidecars. The tested 5.00 install has about 7.2 GiB of movie data, though your package can be smaller. The preview reports the exact bundle size. Keep extra space for generated files, bundle creation, and the installed Mods copy. Clear this option to skip cutscenes."),
             (self.generate_button, "Check semantic compatibility and create a preview before installing."),
             (self.unmatched_button, "Open the interactive w3strings entries that could not be matched."),
             (self.cutscene_details_button,
-             "Review cutscene scan counts, subtitle matching, output size, and generated resources."),
+             "Review cutscene scan counts, subtitle matching, movie bundle size and targets, and included resources."),
             (self.cutscene_unmatched_button, "Open cutscene cues and resources that could not be matched or were skipped."),
-            (self.install_button, "Review exact targets, back up originals, and install a fresh generated preview."),
-            (self.modify_button, "Apply a new preview to an active install while preserving original backups."),
-            (self.uninstall_button, "Review exact targets and restore the validated original backups."),
+            (self.install_button, "Review exact targets and install a fresh preview as manager-mod overrides."),
+            (self.modify_button, "Apply the preview to the manager mod."),
+            (self.uninstall_button, "Remove the manager-mod files installed by this app."),
             (self.rescan_button, "Refresh resource inventory, preview freshness, and managed install conflicts."),
-            (self.help_button, "Read the four-step workflow, merge modes, and backup/restore explanation."),
+            (self.help_button, "Read the four-step workflow, merge modes, and install/uninstall explanation."),
         )
         for widget, hint in hints:
             attach_tooltip(widget, hint)
@@ -701,11 +690,8 @@ class W3DualSubtitleApp:
                                    else error_text]
                         target_paths = getattr(error, "target_paths", ())
                         rollback_errors = getattr(error, "rollback_errors", ())
-                        backup = getattr(error, "backup_directory", None)
                         if target_paths:
                             details.append("Affected files: " + ", ".join(target_paths))
-                        if backup:
-                            details.append(f"Original backups: {backup}")
                         if rollback_errors:
                             details.append("Rollback diagnostics: " + "; ".join(rollback_errors))
                         self.status_var.set(f"{label.capitalize()} failed: " + " | ".join(details))
@@ -792,11 +778,8 @@ class W3DualSubtitleApp:
         freshness = None
         if record is not None:
             try:
-                overrides = source_overrides_for_pair(
-                    game, manifest, record.primary_language, record.secondary_language,
-                )
                 freshness = generation.compare_generation(
-                    record, game, overrides or None, progress_callback=progress_callback,
+                    record, game, progress_callback=progress_callback,
                 )
             except Exception:
                 freshness = Freshness.STALE
@@ -844,6 +827,7 @@ class W3DualSubtitleApp:
             state="normal" if self._cutscene_unmatched_report_path() else "disabled"
         )
         record = snapshot.generation_record if snapshot else None
+        self._update_cutscene_space_note()
         unmatched_count = (record.unmatched_entries_count
                            if record and record.unmatched_entries_count is not None else None)
         merge_summary = (_merge_summary(snapshot.generation_record)
@@ -854,12 +838,12 @@ class W3DualSubtitleApp:
             freshness_label = (snapshot.generation_freshness.value.replace("_", " ")
                                if snapshot.generation_freshness else "unknown")
             for relative, digest in sorted(record.output_hashes.items()):
-                target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
-                self.preview.insert("", "end", values=(f"{target} — {digest}",))
-            for relative, digest in sorted(record.cutscene_output_hashes.items()):
                 target = snapshot.selected.game.root.joinpath(
-                    *install.MOD_CONTENT.split("/"), *Path(relative).parts,
+                    *Path(install.mod_resource_target(relative)).parts,
                 )
+                self.preview.insert("", "end", values=(f"{target} — {digest}",))
+            for relative, digest in sorted(record.cutscene_package_hashes.items()):
+                target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
                 self.preview.insert("", "end", values=(f"{target} — {digest}",))
             manifest = snapshot.manifest
             if manifest and manifest.active:
@@ -867,10 +851,7 @@ class W3DualSubtitleApp:
                     if relative in generated_install_paths:
                         continue
                     target = snapshot.selected.game.root.joinpath(*Path(relative).parts)
-                    if relative.startswith(install.MOD_CONTENT + "/"):
-                        label, digest = "REMOVE managed override", target_record.installed_sha256
-                    else:
-                        label, digest = "RESTORE original", target_record.original_sha256
+                    label, digest = "REMOVE managed override", target_record.installed_sha256
                     self.preview.insert(
                         "", "end", values=(f"{label}: {target} — {digest}",),
                     )
@@ -889,7 +870,7 @@ class W3DualSubtitleApp:
             if comparison and comparison.conflict_paths:
                 self.status_var.set(
                     f"Install conflicts: {', '.join(comparison.conflict_paths)}; "
-                    f"originals backed up at {manifest.backup_directory}"
+                    + "manager-mod overrides are active; base game files are left in place"
                     + (f"; {merge_summary}" if merge_summary else "")
                     + (f"; {unmatched_count:,} unmatched identities"
                        if unmatched_count is not None else "")
@@ -904,7 +885,8 @@ class W3DualSubtitleApp:
                              if comparison else "unknown")
                 self.status_var.set(
                     f"Active install {manifest.primary_language} + {manifest.secondary_language}; "
-                    f"{freshness}; originals at {manifest.backup_directory}"
+                    f"{freshness}; "
+                    + "manager-mod overrides active; base game files are left in place"
                     + (f"; {merge_summary}" if merge_summary else "")
                     + (f"; {unmatched_count:,} unmatched identities"
                        if unmatched_count is not None else "")
@@ -996,8 +978,42 @@ class W3DualSubtitleApp:
         if self._busy:
             return
         self._refresh_action_buttons()
+        self._update_cutscene_space_note()
         state = "enabled" if self.include_cutscenes_var.get() else "disabled"
         self.status_var.set(f"Cutscene subtitles {state}; generate a new preview to apply the option.")
+
+    def _update_cutscene_space_note(self):
+        """Show a current package size after preview, or a plain warning beforehand."""
+        if not hasattr(self, "cutscene_space_var"):
+            return
+        if not self.include_cutscenes_var.get():
+            self.cutscene_space_var.set(
+                "Cutscene outputs are disabled; Generate Preview will skip movie files."
+            )
+            return
+        record = self.snapshot.generation_record if self.snapshot else None
+        current = bool(
+            record and record.include_cutscenes and self.include_cutscenes_var.get()
+            and self.snapshot.generation_freshness in
+            (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY)
+        )
+        if not current:
+            self.cutscene_space_var.set(
+                "Full movie files are included in the mod bundle. The tested 5.00 install has "
+                "about 7.2 GiB of movie data; your package can be smaller. The preview shows "
+                "the exact package size. Keep extra space for generated and installed copies."
+            )
+            return
+        package_bytes = sum(record.cutscene_package_sizes.values())
+        if package_bytes:
+            self.cutscene_space_var.set(
+                f"Cutscene bundle size: {_format_bytes(package_bytes)}. "
+                "Full movie files are included; keep extra working space free for generation and installation."
+            )
+        else:
+            self.cutscene_space_var.set(
+                "No cutscene overrides were generated for this language pair; package size is 0 B."
+            )
 
     def _check_readiness(self):
         """Check paths and pairing only; generation owns semantic validation."""
@@ -1020,7 +1036,7 @@ class W3DualSubtitleApp:
             primary, secondary = self.primary_var.get(), self.secondary_var.get()
             if not primary or not secondary or primary.casefold() == secondary.casefold():
                 return False
-            sources = generation._source_paths(self.snapshot.selected.game, primary, secondary, None)
+            sources = generation._source_paths(self.snapshot.selected.game, primary, secondary)
             return all(path.is_file() for path in sources.values())
         except Exception:
             return False
@@ -1038,7 +1054,12 @@ class W3DualSubtitleApp:
             and record.include_cutscenes == self.include_cutscenes_var.get()
         )
         if active and snapshot and snapshot.manifest and record:
-            pair_matches = pair_matches and record.generation_id != snapshot.manifest.generation_id
+            same_installed_result = (
+                record.generation_id == snapshot.manifest.generation_id
+                and _generation_install_relative_paths(record)
+                == set(snapshot.manifest.target_files)
+            )
+            pair_matches = pair_matches and not same_installed_result
         pairable = self._resources_pairable()
         actions = build_action_state(
             has_game=snapshot is not None,
@@ -1081,10 +1102,10 @@ class W3DualSubtitleApp:
         if manifest and manifest.active:
             if comparison and comparison.conflict_paths:
                 raise install.InstallError(
-                    "Managed files or original backups conflict; resolve these exact paths before continuing: "
+                    "Managed files conflict; "
+                    "resolve these exact paths before continuing: "
                     + ", ".join(comparison.conflict_paths),
                     target_paths=comparison.conflict_paths,
-                    backup_directory=manifest.backup_directory,
                 )
             if (not allow_stale_install and comparison and comparison.freshness not in (
                     Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY)):
@@ -1105,17 +1126,16 @@ class W3DualSubtitleApp:
             game, _state, manifest, _comparison = self._fresh_game_and_manifest(
                 progress_callback=progress_callback,
             )
-            overrides = source_overrides_for_pair(game, manifest, primary, secondary)
             converter = selected_converter(converter_raw)
             record = generation.generate(
                 GenerationRequest(
-                    game, primary, secondary, mode, overrides or None,
+                    game, primary, secondary, mode,
                     include_cutscenes=include_cutscenes,
                 ),
                 self.app_root, converter, progress_callback=progress_callback,
             )
             freshness = generation.compare_generation(
-                record, game, overrides or None, progress_callback=progress_callback,
+                record, game, progress_callback=progress_callback,
             )
             return record, freshness
 
@@ -1126,16 +1146,19 @@ class W3DualSubtitleApp:
         if self.snapshot:
             self.snapshot = replace(self.snapshot, generation_record=record,
                                     generation_freshness=freshness)
+        self._update_cutscene_space_note()
         self._render_generation_and_install()
         merge_summary = _merge_summary(record)
-        targets_count = len(record.output_files) + len(record.cutscene_output_files)
+        targets_count = len(record.output_files) + len(record.cutscene_package_files)
         status_parts = [f"{targets_count:,} target files"]
         if merge_summary:
             status_parts.append(merge_summary)
         if record.unmatched_entries_count is not None:
             status_parts.append(f"{record.unmatched_entries_count:,} unmatched identities")
         if record.include_cutscenes:
-            status_parts.append("Cutscene details available")
+            status_parts.append(
+                f"cutscene package {_format_bytes(sum(record.cutscene_package_sizes.values()))}"
+            )
         self.status_var.set(
             f"Preview ready: {'; '.join(status_parts)}. "
             f"Source freshness: {freshness.value}. Review paths and hashes before Install or Modify."
@@ -1147,6 +1170,11 @@ class W3DualSubtitleApp:
         if record is None or not record.include_cutscenes:
             return
         lines = [_cutscene_summary_text(record), ""]
+        lines.append("Installed movie package targets:")
+        lines.extend(f"  {target}" for target in sorted(record.cutscene_package_files))
+        if not record.cutscene_package_files:
+            lines.append("  (no package; no cutscene overrides were generated)")
+        lines.append("")
         resources = sorted(record.cutscene_output_files)
         lines.append(f"Generated cutscene resources ({len(resources):,}):")
         lines.extend(f"  {resource}" for resource in resources)
@@ -1247,11 +1275,8 @@ class W3DualSubtitleApp:
             )
             if manifest is None or not manifest.active:
                 raise install.InstallError("There is no active install to modify")
-            overrides = source_overrides_for_pair(
-                game, manifest, record.primary_language, record.secondary_language,
-            )
             freshness = generation.compare_generation(
-                record, game, overrides or None, progress_callback=progress_callback,
+                record, game, progress_callback=progress_callback,
             )
             if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
                 raise install.InstallError(f"Preview is {freshness.value}; regenerate before Modify")
@@ -1293,20 +1318,18 @@ class W3DualSubtitleApp:
                 raise install.InstallError("There is no active install to uninstall")
             if comparison and comparison.conflict_paths:
                 raise install.InstallError(
-                    "Uninstall is unsafe while these managed files or backups conflict: "
+                    "Uninstall is unsafe while these managed files conflict: "
                     + ", ".join(comparison.conflict_paths),
                     target_paths=comparison.conflict_paths,
-                    backup_directory=manifest.backup_directory,
                 )
             result = install.uninstall(game, manifest, progress_callback=progress_callback)
             if result.conflicts or result.error:
                 raise install.InstallError(
                     result.error or "Uninstall stopped because managed files conflict",
                     target_paths=result.conflicts, rollback_errors=result.rollback_errors,
-                    backup_directory=result.backup_directory,
                 )
             refreshed = ScannedGame(self.snapshot.selected.candidate, game)
-            return result, self._load_game_snapshot(refreshed, progress_callback), result.restored_paths
+            return result, self._load_game_snapshot(refreshed, progress_callback), result.removed_paths
 
         manifest = reviewed_manifest
         root = self.snapshot.selected.game.root
@@ -1314,7 +1337,7 @@ class W3DualSubtitleApp:
                         for path in manifest.target_files)
         text = confirmation_text(
             "Uninstall", root, manifest.primary_language, manifest.secondary_language,
-            targets, manifest.backup_directory,
+            targets,
         )
         self.status_var.set("Review the target list in the confirmation window.")
         confirmed = confirm_then_submit(
@@ -1328,10 +1351,7 @@ class W3DualSubtitleApp:
         operation_result, snapshot, completed_paths = result
         self._apply_snapshot(snapshot)
         completed_count = len(completed_paths)
-        backup_directory = getattr(operation_result, "backup_directory", None)
         status = f"Operation completed: {completed_count:,} file(s)."
-        if backup_directory is not None:
-            status += f" Original backups: {backup_directory}"
         self.status_var.set(status)
         self._refresh_action_buttons()
 

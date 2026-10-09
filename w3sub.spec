@@ -18,6 +18,8 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
+    # Strip bundled module/function docstrings from bytecode to reduce the one-file bundle.
+    optimize=2,
     # The native codec hashes its physical source file for generation provenance.
     module_collection_mode={'w3sub_app.w3strings_native': 'pyz+py'},
 )

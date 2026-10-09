@@ -1,7 +1,7 @@
 """Merge CRI Sofdec UTF-16LE ``.subs`` sidecars without changing row layout.
 
-CRI represents a line break *inside* subtitle text with a NUL character.
-CRLF remains the delimiter between sidecar rows.
+Cue records remain CRLF-delimited. A lone carriage return inside cue text is
+preserved as the game's subtitle line break.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 
 _BOM = b"\xff\xfe"
-_CUE_BREAK = "\x00"
+_CUE_SEPARATOR = "\r"
 
 
 @dataclass(frozen=True)
@@ -54,11 +54,11 @@ def _parse(data: bytes, label: str) -> _Sidecar:
     except UnicodeDecodeError as exc:
         raise ValueError(f"{label} .subs file is not valid UTF-16LE") from exc
 
-    # CRI's sidecar records use CRLF. A bare line break would make cue text
-    # ambiguous, so refuse it instead of silently changing row boundaries.
+    # CRI sidecar records use CRLF. Bare LF would split a record, while a lone
+    # CR inside the cue text is the native line break accepted by the game.
     without_rows = decoded.replace("\r\n", "")
-    if "\r" in without_rows or "\n" in without_rows:
-        raise ValueError(f"{label} .subs file contains a bare line break")
+    if "\n" in without_rows:
+        raise ValueError(f"{label} .subs file contains a bare LF line break")
 
     parts = decoded.split("\r\n")
     rows: list[_Row] = []
@@ -70,6 +70,8 @@ def _parse(data: bytes, label: str) -> _Sidecar:
         line_number = index + 1
         stripped = content.strip()
         if not stripped or content.lstrip().startswith(";"):
+            if "\r" in content:
+                raise ValueError(f"{label} .subs line {line_number}: invalid line break")
             rows.append(_Row(content, ending))
             continue
 
@@ -86,6 +88,8 @@ def _parse(data: bytes, label: str) -> _Sidecar:
         fields = content.split(",", 2)
         if len(fields) != 3:
             raise ValueError(f"{label} .subs line {line_number}: malformed cue row")
+        if "\r" in fields[0] or "\r" in fields[1]:
+            raise ValueError(f"{label} .subs line {line_number}: invalid time field")
         try:
             start = int(fields[0].strip())
             end = int(fields[1].strip())
@@ -135,7 +139,8 @@ def merge_subs(primary_data: bytes, secondary_data: bytes) -> SubsMergeResult:
                 matched_secondary_lines.add(partner.source_line)
                 matched_count += 1
                 if partner.text:
-                    content = row.cue_prefix + cue.text + _CUE_BREAK + partner.text
+                    content = (row.cue_prefix + cue.text.rstrip()
+                               + _CUE_SEPARATOR + partner.text.lstrip())
             else:
                 unmatched_primary.append(cue)
         output.append(content + row.ending)

@@ -17,7 +17,6 @@ from w3sub_app.models import (
     Storefront,
 )
 
-
 class FixtureConverter:
     def __init__(self, executable):
         self.executable = Path(executable)
@@ -36,7 +35,6 @@ class FixtureConverter:
         result = work_dir / "encoded.w3strings"
         result.write_bytes(Path(csv_path).read_bytes())
         return result
-
 
 class InstallTests(unittest.TestCase):
     def setUp(self):
@@ -205,19 +203,6 @@ class InstallTests(unittest.TestCase):
 
     def test_external_manifest_retains_generation_provenance_without_staged_generation(self):
         self.assert_provenance_persisted(self.generate_record())
-
-    def test_generation_and_manifest_capture_classifier_schema_version(self):
-        from w3sub_app.dialogue_index import DialogueIndex, DialogContext
-        source = self.game_root / "content/refs/schema.json"
-        source.parent.mkdir()
-        source.write_text("{}", encoding="utf-8")
-        index = DialogueIndex.from_validated_references(self.game, [source],
-                    {("1", "1"): [DialogContext.SCENE_SUBTITLE]},
-                    source_roots=[source.parent], source_patterns=["*.json"])
-        with patch("w3sub_app.generation.load_dialogue_index", return_value=index):
-            record = generate(GenerationRequest(self.game, "en", "zh", MergeMode.DIALOGUE_ONLY), self.state_root, self.converter)
-            self.assertEqual(getattr(record, "classifier_schema_version", None), index.schema_version)
-            self.assert_provenance_persisted(record)
 
     def test_malformed_generation_provenance_cannot_load_as_valid_install(self):
         manifest = install.install_generation(self.game, self.generate_record(), self.state_root)
@@ -529,7 +514,6 @@ class InstallTests(unittest.TestCase):
             install.install_generation(self.game, record, self.state_root)
         self.assertEqual(outside.read_bytes(), b"preserve outside")
         self.assertEqual((self.game_root / "content/content0/en.w3strings").read_bytes(), before)
-
 
 if __name__ == "__main__":
     unittest.main()

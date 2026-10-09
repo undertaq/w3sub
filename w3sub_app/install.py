@@ -31,7 +31,7 @@ from .models import (
 )
 
 
-INSTALL_MANIFEST_SCHEMA = 2
+INSTALL_MANIFEST_SCHEMA = 3
 MOD_ROOT = "Mods/modW3DualSubtitleManager"
 MOD_CONTENT = MOD_ROOT + "/content"
 
@@ -39,11 +39,10 @@ MOD_CONTENT = MOD_ROOT + "/content"
 class InstallError(RuntimeError):
     """An install operation failed without hiding rollback diagnostics."""
 
-    def __init__(self, message, *, target_paths=(), rollback_errors=(), backup_directory=None):
+    def __init__(self, message, *, target_paths=(), rollback_errors=()):
         super().__init__(message)
         self.target_paths = tuple(target_paths)
         self.rollback_errors = tuple(rollback_errors)
-        self.backup_directory = backup_directory
 
 
 def _running_game_processes() -> tuple[str, ...]:
@@ -110,7 +109,7 @@ def _state_directory(state_root: Path, game_root: Path) -> Path:
         directory = supplied / "games" / key
     directory = directory.resolve()
     if _inside(directory, root):
-        raise InstallError("Install state and backups must stay outside the game folder")
+        raise InstallError("Install state must stay outside the game folder")
     return directory
 
 
@@ -135,15 +134,33 @@ def _is_mod_target(relative: str) -> bool:
     return relative.startswith(MOD_CONTENT + "/")
 
 
+def mod_resource_target(relative: str) -> str:
+    """Map a game-relative string resource into the manager mod's content root."""
+    parts = generation._safe_relative_output(relative)
+    if parts is None or PurePosixPath(relative).suffix.casefold() != ".w3strings":
+        raise InstallError(f"Unsafe manager-mod string resource path: {relative!r}")
+    # The manager mod's content directory already represents the game's
+    # top-level content directory, so do not copy that component a second time.
+    if parts[0].casefold() == "content":
+        parts = parts[1:]
+    if not parts:
+        raise InstallError(f"Manager-mod string resource path is empty: {relative!r}")
+    target = MOD_CONTENT + "/" + "/".join(parts)
+    _safe_relative(target)
+    return target
+
+
 def _safe_relative(relative: str) -> tuple[str, ...]:
     parts = generation._safe_relative_output(relative)
     if parts is not None:
         suffix = PurePosixPath(relative).suffix.casefold()
+        package_targets = {
+            (MOD_CONTENT + "/metadata.store").casefold(),
+            (MOD_CONTENT + "/bundles/movies.bundle").casefold(),
+        }
         if (_is_mod_target(relative) and len(parts) > 3
-                and suffix in {".subs", ".usm"}):
-            return parts
-        if (len(parts) >= 2 and parts[0].casefold() in {"content", "dlc"}
-                and suffix == ".w3strings"):
+                and (suffix in {".subs", ".usm", ".w3strings"}
+                     or relative.casefold() in package_targets)):
             return parts
     raise InstallError(f"Unsafe game target path: {relative!r}")
 
@@ -298,7 +315,6 @@ def _manifest_payload(manifest: InstallManifest) -> dict[str, object]:
         "install_id": manifest.install_id,
         "game_root": str(manifest.game_root),
         "state_directory": str(manifest.state_directory),
-        "backup_directory": str(manifest.backup_directory),
         "storefront": manifest.storefront.value,
         "store_build_id": manifest.store_build_id,
         "generation_id": manifest.generation_id,
@@ -314,9 +330,6 @@ def _manifest_payload(manifest: InstallManifest) -> dict[str, object]:
         "target_files": {
             relative: {
                 "relative_path": target.relative_path,
-                "backup_path": str(target.backup_path) if target.backup_path is not None else None,
-                "original_exists": target.original_exists,
-                "original_sha256": target.original_sha256,
                 "installed_sha256": target.installed_sha256,
             }
             for relative, target in sorted(manifest.target_files.items())
@@ -346,7 +359,7 @@ def _version_from_payload(payload: dict) -> GameVersion:
 def _manifest_from_payload(payload: dict) -> InstallManifest:
     if not isinstance(payload, dict):
         raise ValueError("manifest root must be an object")
-    if type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, INSTALL_MANIFEST_SCHEMA):
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, 2, INSTALL_MANIFEST_SCHEMA):
         raise ValueError("unsupported install manifest schema")
     for name in ("active", "conflicted", "prepared"):
         if name in payload and not isinstance(payload[name], bool):
@@ -356,7 +369,7 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
     if not isinstance(payload.get("conflict_paths", []), list) or any(
             not isinstance(path, str) for path in payload.get("conflict_paths", [])):
         raise ValueError("conflict_paths must be a list of paths")
-    if payload["schema_version"] == 2 and (not isinstance(payload.get("created_directories", []), list)
+    if payload["schema_version"] >= 2 and (not isinstance(payload.get("created_directories", []), list)
             or any(not isinstance(path, str) for path in payload.get("created_directories", []))):
         raise ValueError("created_directories must be a list of paths")
     raw_fingerprint = payload["source_fingerprint"]
@@ -367,13 +380,13 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
     if raw_provenance is not None and not isinstance(raw_provenance, dict):
         raise ValueError("generation_provenance must be an object or null")
     provenance = GenerationProvenance(**raw_provenance) if raw_provenance is not None else None
-    raw_cutscene = payload.get("cutscene_bundle_fingerprint") if payload["schema_version"] == 2 else None
+    raw_cutscene = payload.get("cutscene_bundle_fingerprint") if payload["schema_version"] >= 2 else None
     cutscene_fingerprint = None
     if raw_cutscene is not None:
         if not isinstance(raw_cutscene, dict) or not isinstance(raw_cutscene.get("entries"), dict):
             raise ValueError("cutscene_bundle_fingerprint must contain an entries object")
         cutscene_fingerprint = ResourceFingerprint(dict(raw_cutscene["entries"]), raw_cutscene["digest"])
-    raw_content = payload.get("cutscene_bundle_content_fingerprint") if payload["schema_version"] == 2 else None
+    raw_content = payload.get("cutscene_bundle_content_fingerprint") if payload["schema_version"] >= 2 else None
     content_fingerprint = None
     if raw_content is not None:
         if not isinstance(raw_content, dict) or not isinstance(raw_content.get("entries"), dict):
@@ -383,19 +396,20 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
     for relative, entry in payload["target_files"].items():
         if not isinstance(entry, dict) or entry.get("relative_path") != relative:
             raise ValueError(f"target path key mismatch: {relative}")
+        if not _is_mod_target(relative):
+            raise InstallError(
+                "This install contains direct game-file targets. This version only manages "
+                "the manager mod; restore the game's files through your storefront before continuing."
+            )
         targets[relative] = InstallTarget(
             relative_path=relative,
-            backup_path=Path(entry["backup_path"]) if entry["backup_path"] is not None else None,
-            original_sha256=entry["original_sha256"],
             installed_sha256=entry["installed_sha256"],
-            original_exists=True if payload["schema_version"] == 1 else entry["original_exists"],
         )
     return InstallManifest(
         schema_version=INSTALL_MANIFEST_SCHEMA,
         install_id=payload["install_id"],
         game_root=Path(payload["game_root"]),
         state_directory=Path(payload["state_directory"]),
-        backup_directory=Path(payload["backup_directory"]),
         storefront=Storefront(payload["storefront"]),
         store_build_id=payload.get("store_build_id"),
         generation_id=payload["generation_id"],
@@ -414,7 +428,7 @@ def _manifest_from_payload(payload: dict) -> InstallManifest:
         generation_provenance=provenance,
         cutscene_bundle_fingerprint=cutscene_fingerprint,
         cutscene_bundle_content_fingerprint=content_fingerprint,
-        created_directories=tuple(payload.get("created_directories", ())) if payload["schema_version"] == 2 else (),
+        created_directories=tuple(payload.get("created_directories", ())) if payload["schema_version"] >= 2 else (),
     )
 
 
@@ -438,8 +452,81 @@ def _atomic_write_manifest(manifest: InstallManifest) -> None:
         except OSError:
             pass
         raise InstallError(f"Cannot save install manifest: {error}",
-                           target_paths=manifest.target_files,
-                           backup_directory=manifest.backup_directory) from error
+                           target_paths=manifest.target_files) from error
+
+
+def _migrate_legacy_content_resource_targets(manifest: InstallManifest) -> InstallManifest:
+    """Adopt exact manager-mod string files at their corrected content-root paths.
+
+    Earlier builds duplicated the game's leading ``content/`` directory under
+    the mod's own ``content/`` directory. Migrate only when the old target is
+    absent and the corrected target hashes to the exact bytes in the manifest.
+    This updates app state only; it never moves, overwrites, or removes a game
+    file. Any uncertain or edited target remains a conflict for review.
+    """
+    if not manifest.active or manifest.prepared:
+        return manifest
+    old_prefix = MOD_CONTENT + "/content/"
+    old_prefix_folded = old_prefix.casefold()
+    occupied = {relative.casefold() for relative in manifest.target_files}
+    remapped: dict[str, str] = {}
+    root = _normalized_path(manifest.game_root)
+    for relative, target in manifest.target_files.items():
+        if (not relative.casefold().startswith(old_prefix_folded)
+                or PurePosixPath(relative).suffix.casefold() != ".w3strings"):
+            continue
+        corrected = MOD_CONTENT + "/" + relative[len(old_prefix):]
+        if corrected.casefold() in occupied:
+            continue
+        try:
+            if (_current_digest(root, relative) is None
+                    and _current_digest(root, corrected) == target.installed_sha256):
+                remapped[relative] = corrected
+        except (InstallError, OSError):
+            continue
+    if not remapped or len({path.casefold() for path in remapped.values()}) != len(remapped):
+        return manifest
+
+    target_files = {
+        remapped.get(relative, relative): InstallTarget(
+            remapped.get(relative, relative), target.installed_sha256,
+        )
+        for relative, target in manifest.target_files.items()
+    }
+    if len({path.casefold() for path in target_files}) != len(target_files):
+        return manifest
+
+    # Keep cleanup ownership aligned to directories that now exist along the
+    # adopted targets. Empty directories are removed only after owned files are
+    # safely uninstalled; nonempty directories are always preserved.
+    created = set()
+    try:
+        for directory in manifest.created_directories:
+            if _directory_path(root, directory).is_dir():
+                created.add(directory)
+        for relative in remapped.values():
+            parts = _safe_relative(relative)
+            for length in range(1, len(parts)):
+                directory = "/".join(parts[:length])
+                if directory == "Mods" or directory == MOD_ROOT or directory.startswith(MOD_ROOT + "/"):
+                    if _directory_path(root, directory).is_dir():
+                        created.add(directory)
+    except (InstallError, OSError):
+        return manifest
+
+    migrated = replace(
+        manifest,
+        target_files=target_files,
+        created_directories=tuple(sorted(created)),
+        conflicted=False,
+        conflict_paths=(),
+    )
+    try:
+        _validate_manifest(migrated, root)
+        _atomic_write_manifest(migrated)
+    except InstallError:
+        return manifest
+    return migrated
 
 
 def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
@@ -449,10 +536,7 @@ def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
     root = _normalized_path(game_root)
     if _path_identity(manifest.game_root) != _path_identity(root):
         raise InstallError("Install manifest belongs to a different game folder")
-    state = _validate_state_directory(manifest.state_directory, root)
-    expected_backup = state / "backups" / manifest.install_id
-    if _normalized_path(manifest.backup_directory) != expected_backup.resolve():
-        raise InstallError("Install backup path does not match its game-state location")
+    _validate_state_directory(manifest.state_directory, root)
     if (not isinstance(manifest.install_id, str) or len(manifest.install_id) != 32
             or any(character not in "0123456789abcdef" for character in manifest.install_id)):
         raise InstallError("Install manifest has an invalid install id")
@@ -467,7 +551,7 @@ def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
         raise InstallError("Install manifest target record is invalid")
     if set(manifest.target_files) != {target.relative_path for target in manifest.target_files.values()}:
         raise InstallError("Install manifest contains inconsistent target paths")
-    if manifest.schema_version not in (1, INSTALL_MANIFEST_SCHEMA):
+    if manifest.schema_version not in (1, 2, INSTALL_MANIFEST_SCHEMA):
         raise InstallError("Install manifest has an unsupported schema")
     if (not isinstance(manifest.created_directories, tuple)
             or any(not isinstance(path, str) for path in manifest.created_directories)):
@@ -493,18 +577,10 @@ def _validate_manifest(manifest: InstallManifest, game_root: Path) -> None:
         raise InstallError("Install manifest contains aliased target paths")
     for relative, target in manifest.target_files.items():
         _safe_relative(relative)
-        if type(target.original_exists) is not bool or not _is_digest(target.installed_sha256):
+        if not _is_digest(target.installed_sha256):
             raise InstallError(f"Install manifest has invalid target metadata for {relative}")
-        if _is_mod_target(relative):
-            if (target.original_exists or target.backup_path is not None
-                    or target.original_sha256 is not None or fingerprint is None):
-                raise InstallError(f"Managed mod target cannot have an original backup: {relative}")
-        else:
-            if not target.original_exists or not _is_digest(target.original_sha256) or target.backup_path is None:
-                raise InstallError(f"Install manifest has an invalid original for {relative}")
-            expected = expected_backup.joinpath(*_safe_relative(relative))
-            if _normalized_path(target.backup_path) != expected.resolve():
-                raise InstallError(f"Install backup path is invalid for {relative}")
+        if not _is_mod_target(relative):
+            raise InstallError(f"Install manifest target is outside the manager mod: {relative}")
 
 
 def _is_digest(value: object) -> bool:
@@ -536,7 +612,7 @@ def _load_manifest_file(path: Path, game_root: Path | None = None) -> InstallMan
         expected_path = manifest.state_directory / "install.json"
         if _normalized_path(path) != _normalized_path(expected_path):
             raise ValueError("manifest is stored outside its declared state directory")
-        return manifest
+        return _migrate_legacy_content_resource_targets(manifest)
     except (OSError, ValueError, TypeError, KeyError) as error:
         if isinstance(error, InstallError):
             raise
@@ -631,115 +707,11 @@ def _copy_new(source: Path, destination: Path) -> str:
     return digest.hexdigest()
 
 
-def _lexical_path_identity(path: Path) -> str:
-    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
-
-
-def _prepare_backup_destination(state_directory: Path, backup_directory: Path,
-                                install_id: str, game_root: Path, relative: str,
-                                *, create_parents: bool) -> Path:
-    """Validate every backup parent before a new backup is read or written."""
-    parts = _safe_relative(relative)
-    state = _validate_state_directory(state_directory, game_root)
-    expected_backup_directory = state / "backups" / install_id
-    if (_lexical_path_identity(Path(backup_directory))
-            != _lexical_path_identity(expected_backup_directory)):
-        raise InstallError("Backup directory does not match the manifest location")
-    raw_state = Path(state_directory).expanduser().absolute()
-    raw_games = raw_state.parent
-    try:
-        if _is_reparse(raw_games) or _is_reparse(raw_state):
-            raise InstallError("Game state parent is a symbolic link or junction")
-        if not raw_games.is_dir() or not raw_state.is_dir():
-            raise InstallError("Game state directory is unavailable")
-        games_resolved = raw_games.resolve(strict=True)
-        state_resolved = raw_state.resolve(strict=True)
-    except OSError as error:
-        raise InstallError(f"Cannot validate game state directory: {error}") from error
-    if state_resolved.parent != games_resolved or state_resolved != state:
-        raise InstallError("Game state directory resolves outside its declared location")
-    current = state
-    components = ("backups", install_id, *parts[:-1])
-    for component in components:
-        current = current / component
-        try:
-            current.lstat()
-        except FileNotFoundError:
-            if not create_parents:
-                raise InstallError(f"Original backup parent is missing: {current}")
-            try:
-                current.mkdir()
-            except FileExistsError:
-                pass
-            except OSError as error:
-                raise InstallError(f"Cannot create backup parent {current}: {error}") from error
-        except OSError as error:
-            raise InstallError(f"Cannot inspect backup parent {current}: {error}") from error
-        try:
-            if _is_reparse(current):
-                raise InstallError(f"Backup parent is a symbolic link or junction: {current}")
-            resolved = current.resolve(strict=True)
-        except OSError as error:
-            raise InstallError(f"Cannot resolve backup parent {current}: {error}") from error
-        if not _inside(resolved, state_resolved) or not resolved.is_dir():
-            raise InstallError(f"Backup parent escapes the game state folder: {current}")
-    return current / parts[-1]
-
-
-def _backup_target(root: Path, backup_directory: Path, relative: str) -> InstallTarget:
-    target = _target_path(root, relative)
-    backup = _prepare_backup_destination(
-        backup_directory.parent.parent, backup_directory, backup_directory.name,
-        root, relative, create_parents=True,
-    )
-    digest = _copy_new(target, backup)
-    if (_hash_file(target) != digest or _hash_file(backup) != digest
-            or _is_reparse(backup)
-            or not _inside(backup.resolve(strict=True), backup_directory)):
-        raise InstallError(f"Game target changed while it was being backed up: {relative}")
-    return InstallTarget(relative, backup, digest, "0" * 64)
-
-
-def _validate_backup(manifest: InstallManifest, relative: str, target: InstallTarget) -> Path:
-    if not target.original_exists:
-        raise InstallError(f"Manager-created file has no original backup: {relative}")
-    backup = _prepare_backup_destination(
-        manifest.state_directory, manifest.backup_directory, manifest.install_id,
-        manifest.game_root, relative, create_parents=False,
-    )
-    try:
-        if _lexical_path_identity(Path(target.backup_path)) != _lexical_path_identity(backup):
-            raise InstallError(f"Backup path is invalid for {relative}")
-        if _is_reparse(backup) or not _inside(
-                backup.resolve(strict=True), manifest.backup_directory):
-            raise InstallError(f"Original backup path is redirected for {relative}")
-        if not backup.is_file():
-            raise InstallError(f"Original backup is unavailable for {relative}")
-        if _hash_file(backup) != target.original_sha256:
-            raise InstallError(f"Original backup hash does not match manifest for {relative}")
-        return backup
-    except OSError as error:
-        raise InstallError(f"Cannot validate original backup for {relative}: {error}") from error
-
-
-def _generation_overrides(manifest: InstallManifest,
-                          record: GenerationRecord) -> dict[str, Path]:
-    overrides = {}
-    for relative in record.source_fingerprint.entries:
-        target = manifest.target_files.get(relative)
-        if target is not None:
-            overrides[relative] = _validate_backup(manifest, relative, target)
-    return overrides
-
-
 def _generation_freshness(record: GenerationRecord, game: GameInstallation,
-                          overrides: dict[str, Path] | None = None, *,
                           progress_callback: ProgressCallback | None = None) -> Freshness:
     if _path_identity(record.game_root) != _path_identity(game.root):
         return Freshness.STALE
-    return generation.compare_generation(
-        record, game, overrides, progress_callback=progress_callback,
-    )
+    return generation.compare_generation(record, game, progress_callback=progress_callback)
 
 
 def _rescan_game(game: GameInstallation) -> GameInstallation:
@@ -749,7 +721,6 @@ def _rescan_game(game: GameInstallation) -> GameInstallation:
 
 
 def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation,
-                                overrides: dict[str, Path] | None = None, *,
                                 progress_callback: ProgressCallback | None = None) -> None:
     """Called under the operation lock after staging, before any game replacement."""
     report_progress(progress_callback, "Rechecking game before replacement", 0, None)
@@ -759,7 +730,7 @@ def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation
         if current.version != game.version or current.storefront is not game.storefront:
             raise InstallError("Game version/storefront changed during operation; rescan and retry")
         freshness = _generation_freshness(
-            record, current, overrides, progress_callback=progress_callback,
+            record, current, progress_callback=progress_callback,
         )
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation became {freshness.value} before mutation; regenerate")
@@ -769,7 +740,9 @@ def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation
                         current, progress_callback=progress_callback, phase="Checking cutscene bundle content identity")
                     != record.cutscene_bundle_content_fingerprint):
                 raise InstallError("Source bundle contents changed before mutation; regenerate")
-        if not generation._verify_outputs(record, game.root, progress_callback=progress_callback):
+        if not generation._verify_outputs(
+                record, game.root, progress_callback=progress_callback,
+                verify_cutscene_hashes=False):
             raise InstallError("Generated outputs changed immediately before mutation")
     except InstallError:
         raise
@@ -777,21 +750,14 @@ def _revalidate_before_mutation(record: GenerationRecord, game: GameInstallation
         raise InstallError(f"Cannot revalidate game immediately before mutation: {error}") from error
 
 
-def _require_generation_baselines(targets: dict[str, InstallTarget], record: GenerationRecord,
-                                  backup_directory: Path) -> None:
-    for relative, target in targets.items():
-        if target.original_exists and target.original_sha256 != record.source_fingerprint.entries.get(relative):
-            raise InstallError(f"Original backup differs from generation baseline: {relative}",
-                               target_paths=(relative,), backup_directory=backup_directory)
-
-
 def _verified_outputs(record: GenerationRecord, game: GameInstallation, *,
                       progress_callback: ProgressCallback | None = None) -> dict[str, Path]:
     if not generation._verify_outputs(record, game.root, progress_callback=progress_callback):
         raise InstallError("Generation output inventory or hash is invalid")
-    outputs = {relative: Path(raw) for relative, raw in record.output_files.items()}
-    outputs.update({MOD_CONTENT + "/" + relative: Path(raw)
-                    for relative, raw in record.cutscene_output_files.items()})
+    outputs = {mod_resource_target(relative): Path(raw)
+               for relative, raw in record.output_files.items()}
+    outputs.update({relative: Path(raw)
+                    for relative, raw in record.cutscene_package_files.items()})
     folded = [relative.casefold() for relative in outputs]
     if len(folded) != len(set(folded)):
         raise InstallError("Generation contains aliased install targets")
@@ -804,13 +770,16 @@ def _verified_outputs(record: GenerationRecord, game: GameInstallation, *,
 
 
 def _output_hashes(record: GenerationRecord) -> dict[str, str]:
-    return {**record.output_hashes, **{MOD_CONTENT + "/" + relative: digest
-            for relative, digest in record.cutscene_output_hashes.items()}}
+    return {
+        **{mod_resource_target(relative): digest
+           for relative, digest in record.output_hashes.items()},
+        **{relative: digest for relative, digest in record.cutscene_package_hashes.items()},
+    }
 
 
 def _make_manifest(game: GameInstallation, record: GenerationRecord,
-                   state_directory: Path, backup_directory: Path,
-                   install_id: str, targets: dict[str, InstallTarget], *,
+                   state_directory: Path, install_id: str,
+                   targets: dict[str, InstallTarget], *,
                    active: bool, conflicted: bool = False,
                    conflict_paths: tuple[str, ...] = (),
                    prepared: bool = False) -> InstallManifest:
@@ -823,7 +792,6 @@ def _make_manifest(game: GameInstallation, record: GenerationRecord,
         install_id=install_id,
         game_root=_normalized_path(game.root),
         state_directory=state_directory,
-        backup_directory=backup_directory,
         storefront=game.storefront,
         store_build_id=game.version.store_build_id,
         generation_id=record.generation_id,
@@ -1019,7 +987,6 @@ def _state_child_directory(state: Path, parent: Path, name: str, *, exclusive: b
 
 def _apply_transaction(game: GameInstallation,
                        state_directory: Path,
-                       backup_directory: Path,
                        prepared_manifest: InstallManifest,
                        final_manifest: InstallManifest,
                        previous_manifest: InstallManifest | None,
@@ -1032,8 +999,8 @@ def _apply_transaction(game: GameInstallation,
                        operation_name: str) -> InstallManifest:
     """Commit replacements, exclusive creates and removals as one rollback unit.
 
-    None hashes represent absence. Originals and rollback snapshots are never
-    inferred from a missing target; rollback preserves unexpected external bytes.
+    None hashes represent absence. Rollback snapshots preserve the previous
+    mod files if publication fails.
     """
     root = _normalized_path(game.root)
     if os.name != "nt" and any(_is_mod_target(relative) for relative in desired_sources):
@@ -1052,10 +1019,10 @@ def _apply_transaction(game: GameInstallation,
             raise InstallError(f"Existing game target cannot be created or removed: {relative}")
         if _current_digest(root, relative) != expected_current[relative]:
             raise InstallError(f"Game target changed before transaction: {relative}",
-                               target_paths=(relative,), backup_directory=backup_directory)
+                               target_paths=(relative,))
         if source is not None and _hash_file(source) != desired_hashes[relative]:
             raise InstallError(f"Transaction source hash changed: {relative}",
-                               target_paths=(relative,), backup_directory=backup_directory)
+                               target_paths=(relative,))
 
     transaction_directory = state_directory / "transactions" / uuid.uuid4().hex
     snapshots: dict[str, Path] = {}
@@ -1082,7 +1049,7 @@ def _apply_transaction(game: GameInstallation,
                 digest = _copy_new(target, snapshot)
                 if digest != expected_current[relative]:
                     raise InstallError(f"Game target changed while snapshotting: {relative}",
-                                       target_paths=(relative,), backup_directory=backup_directory)
+                                       target_paths=(relative,))
                 snapshots[relative] = snapshot
             report_progress(progress_callback, f"{operation_name}: snapshotting targets", number, len(targets))
 
@@ -1096,7 +1063,7 @@ def _apply_transaction(game: GameInstallation,
                 stages[relative] = stage
                 if _hash_file(stage) != desired_hashes[relative]:
                     raise InstallError(f"Staged replacement hash mismatch: {relative}",
-                                       target_paths=(relative,), backup_directory=backup_directory)
+                                       target_paths=(relative,))
             report_progress(progress_callback, f"{operation_name}: staging files", number, len(targets))
         directories = tuple(sorted(prior_directories | created))
         prepared_manifest = replace(prepared_manifest, created_directories=directories)
@@ -1113,12 +1080,12 @@ def _apply_transaction(game: GameInstallation,
         for number, (relative, target) in enumerate(targets.items(), 1):
             if _current_digest(root, relative) != expected_current[relative]:
                 raise InstallError(f"Game target changed during transaction: {relative}",
-                                   target_paths=(relative,), backup_directory=backup_directory)
+                                   target_paths=(relative,))
             if desired_sources[relative] is not None:
                 if (_is_reparse(stages[relative])
                         or _hash_file(stages[relative]) != desired_hashes[relative]):
                     raise InstallError(f"Staged replacement changed before publication: {relative}",
-                                       target_paths=(relative,), backup_directory=backup_directory)
+                                       target_paths=(relative,))
             # OS errors can be ambiguous about whether a mutation happened.
             attempted.append(relative)
             if _is_mod_target(relative) and expected_current[relative] is not None:
@@ -1140,7 +1107,7 @@ def _apply_transaction(game: GameInstallation,
                 except FileExistsError as error:
                     attempted.pop()  # Exclusive publication made no change.
                     raise InstallError(f"Unmanaged file appeared before creation: {relative}",
-                                       target_paths=(relative,), backup_directory=backup_directory) from error
+                                       target_paths=(relative,)) from error
             else:
                 os.replace(stages[relative], target)
             report_progress(progress_callback, f"{operation_name}: replacing targets", number, len(targets))
@@ -1148,7 +1115,7 @@ def _apply_transaction(game: GameInstallation,
         for number, relative in enumerate(targets, 1):
             if _current_digest(root, relative) != desired_hashes[relative]:
                 raise InstallError(f"Installed target hash verification failed: {relative}",
-                                   target_paths=(relative,), backup_directory=backup_directory)
+                                   target_paths=(relative,))
             report_progress(progress_callback, f"{operation_name}: verifying installed targets", number, len(targets))
         # Dispose only the locked objects whose captured bytes matched. Their
         # verified snapshots remain available if manifest publication fails.
@@ -1256,8 +1223,7 @@ def _apply_transaction(game: GameInstallation,
         paths = set(attempted)
         if isinstance(operation_error, InstallError):
             paths.update(operation_error.target_paths)
-        raise InstallError(message, target_paths=tuple(sorted(paths)), rollback_errors=rollback_errors,
-                           backup_directory=backup_directory) from operation_error
+        raise InstallError(message, target_paths=tuple(sorted(paths)), rollback_errors=rollback_errors) from operation_error
     finally:
         for quarantine in (*quarantines.values(), *rollback_quarantines):
             quarantine.close()  # Undiscarded originals remain named for recovery.
@@ -1292,7 +1258,7 @@ def _apply_transaction(game: GameInstallation,
 def install_generation(game: GameInstallation, generation_record: GenerationRecord,
                        state_root: Path, *,
                        progress_callback: ProgressCallback | None = None) -> InstallManifest:
-    """Back up originals and atomically install one verified generation."""
+    """Atomically install one verified generation as manager-mod overrides."""
     root = _normalized_path(game.root)
     state = _state_directory(state_root, root)
     state.mkdir(parents=True, exist_ok=True)
@@ -1308,42 +1274,27 @@ def install_generation(game: GameInstallation, generation_record: GenerationReco
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation is {freshness.value}; regenerate before installing")
         outputs = _verified_outputs(generation_record, game, progress_callback=progress_callback)
-        if any(_is_mod_target(relative) for relative in outputs):
-            _validate_mod_inventory(root, None)
+        if any(not _is_mod_target(relative) for relative in outputs):
+            raise InstallError("Generated outputs must be installed as manager-mod files")
+        _validate_mod_inventory(root, None)
         output_hashes = _output_hashes(generation_record)
         install_id = uuid.uuid4().hex
-        backup_directory = state / "backups" / install_id
-        try:
-            if outputs:
-                report_progress(progress_callback, "Install: backing up originals", 0, len(outputs))
-            backup_parent = _state_child_directory(state, state, "backups")
-            _state_child_directory(state, backup_parent, install_id, exclusive=True)
-            targets = {}
-            for number, relative in enumerate(sorted(outputs), 1):
-                if _is_mod_target(relative):
-                    if _current_digest(root, relative) is not None:
-                        raise InstallError(f"Unmanaged mod file already exists: {relative}", target_paths=(relative,))
-                    targets[relative] = InstallTarget(relative, None, None, "0" * 64, False)
-                else:
-                    targets[relative] = _backup_target(root, backup_directory, relative)
-                report_progress(progress_callback, "Install: backing up originals",
-                                number, len(outputs))
-        except Exception as error:
-            if isinstance(error, InstallError):
-                raise
-            raise InstallError(f"Cannot back up game originals: {error}",
-                               backup_directory=backup_directory) from error
+        if outputs:
+            report_progress(progress_callback, "Install: preparing manager-mod targets", 0, len(outputs))
         targets = {
-            relative: replace(target, installed_sha256=output_hashes[relative])
-            for relative, target in targets.items()
+            relative: InstallTarget(relative, output_hashes[relative])
+            for relative in sorted(outputs)
         }
-        _require_generation_baselines(targets, generation_record, backup_directory)
-        final = _make_manifest(game, generation_record, state, backup_directory,
-                               install_id, targets, active=True)
+        for number, relative in enumerate(sorted(outputs), 1):
+            if _current_digest(root, relative) is not None:
+                raise InstallError(f"Unmanaged mod file already exists: {relative}", target_paths=(relative,))
+            report_progress(progress_callback, "Install: preparing manager-mod targets",
+                            number, len(outputs))
+        final = _make_manifest(game, generation_record, state, install_id, targets, active=True)
         prepared = replace(final, prepared=True)
         desired_hashes = dict(output_hashes)
-        expected = {relative: targets[relative].original_sha256 for relative in outputs}
-        final = _apply_transaction(game, state, backup_directory, prepared, final,
+        expected = {relative: None for relative in outputs}
+        final = _apply_transaction(game, state, prepared, final,
                            None, outputs, desired_hashes, expected,
                            remove_manifest_on_rollback=True,
                            pre_mutation_check=lambda: _revalidate_before_mutation(
@@ -1374,22 +1325,16 @@ def _active_conflicts(manifest: InstallManifest, game: GameInstallation, *,
         except OSError:
             conflicts.append(MOD_ROOT)
     if manifest.target_files:
-        report_progress(progress_callback, "Checking managed targets and backups", 0, len(manifest.target_files))
+        report_progress(progress_callback, "Checking managed targets", 0, len(manifest.target_files))
     for number, (relative, target) in enumerate(sorted(manifest.target_files.items()), 1):
         try:
             path = _target_path(game.root, relative)
             if _hash_file(path) != target.installed_sha256:
                 conflicts.append(relative)
-                continue
-            try:
-                if target.original_exists:
-                    _validate_backup(manifest, relative, target)
-            except InstallError:
-                conflicts.append(relative)
         except (OSError, InstallError):
             conflicts.append(relative)
         finally:
-            report_progress(progress_callback, "Checking managed targets and backups",
+            report_progress(progress_callback, "Checking managed targets",
                             number, len(manifest.target_files))
     return tuple(sorted(set(conflicts)))
 
@@ -1400,19 +1345,9 @@ def _freshness(manifest: InstallManifest, game: GameInstallation, *,
         return Freshness.STALE
     if manifest.storefront is not game.storefront:
         return Freshness.STALE
-    overrides = {}
-    if manifest.active:
-        for relative in manifest.source_fingerprint.entries:
-            target = manifest.target_files.get(relative)
-            if target is not None:
-                try:
-                    overrides[relative] = _validate_backup(manifest, relative, target)
-                except InstallError:
-                    return Freshness.STALE
     try:
         sources = generation._source_paths(
             game, manifest.primary_language, manifest.secondary_language,
-            overrides or None,
         )
         fingerprint = generation._fingerprint_sources(
             sources, progress_callback, "Checking installed source fingerprints",
@@ -1465,58 +1400,10 @@ def _persist_conflicts(manifest: InstallManifest, conflicts: tuple[str, ...]) ->
     return conflicted
 
 
-def _copy_new_backups(manifest: InstallManifest, game: GameInstallation,
-                      relative_paths: set[str], *,
-                      progress_callback: ProgressCallback | None = None) -> dict[str, InstallTarget]:
-    targets = dict(manifest.target_files)
-    if relative_paths:
-        report_progress(progress_callback, "Modify: preparing original backups", 0, len(relative_paths))
-    for number, relative in enumerate(sorted(relative_paths), 1):
-        if relative in targets:
-            if targets[relative].original_exists:
-                _validate_backup(manifest, relative, targets[relative])
-            report_progress(progress_callback, "Modify: preparing original backups",
-                            number, len(relative_paths))
-            continue
-        if _is_mod_target(relative):
-            if _current_digest(game.root, relative) is not None:
-                raise InstallError(f"Unmanaged mod file already exists: {relative}", target_paths=(relative,))
-            targets[relative] = InstallTarget(relative, None, None, "0" * 64, False)
-            report_progress(progress_callback, "Modify: preparing original backups", number, len(relative_paths))
-            continue
-        path = _target_path(game.root, relative)
-        backup = _prepare_backup_destination(
-            manifest.state_directory, manifest.backup_directory,
-            manifest.install_id, game.root, relative, create_parents=True,
-        )
-        try:
-            final_is_reparse = _is_reparse(backup)
-        except FileNotFoundError:
-            final_is_reparse = False
-        if final_is_reparse:
-            raise InstallError(f"New original backup is a symbolic link or junction: {relative}")
-        if backup.exists():
-            if _is_reparse(backup) or not backup.is_file():
-                raise InstallError(f"Unexpected file blocks a new original backup: {relative}")
-            if not _inside(backup.resolve(strict=True), manifest.backup_directory):
-                raise InstallError(f"Existing original backup escapes its backup directory: {relative}")
-            digest = _hash_file(backup)
-        else:
-            digest = _copy_new(path, backup)
-        if digest != _hash_file(path) or digest != _hash_file(backup):
-            raise InstallError(f"New target changed while being backed up: {relative}")
-        new_target = InstallTarget(relative, backup, digest, "0" * 64)
-        _validate_backup(manifest, relative, new_target)
-        targets[relative] = new_target
-        report_progress(progress_callback, "Modify: preparing original backups",
-                        number, len(relative_paths))
-    return targets
-
-
 def modify_install(game: GameInstallation, generation_record: GenerationRecord,
                    manifest: InstallManifest, *,
                    progress_callback: ProgressCallback | None = None) -> InstallManifest:
-    """Modify the active pair using originals from its persistent backups."""
+    """Update the manager-mod files to match a verified generation."""
     _validate_manifest(manifest, game.root)
     if manifest.prepared:
         raise InstallError("A previous operation left a prepared manifest; explicit recovery is required")
@@ -1529,8 +1416,7 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         if comparison.conflict_paths:
             _persist_conflicts(manifest, comparison.conflict_paths)
             raise InstallError("Managed game files were edited; resolve conflicts before Modify",
-                               target_paths=comparison.conflict_paths,
-                               backup_directory=manifest.backup_directory)
+                               target_paths=comparison.conflict_paths)
         if comparison.freshness not in (Freshness.CURRENT,
                                         Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(
@@ -1538,32 +1424,25 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
                 "uninstall safely and regenerate before Modify"
             )
         _validate_game_root(game)
-        overrides = _generation_overrides(manifest, generation_record)
         freshness = _generation_freshness(
-            generation_record, game, overrides, progress_callback=progress_callback,
+            generation_record, game, progress_callback=progress_callback,
         )
         if freshness not in (Freshness.CURRENT, Freshness.VERSION_METADATA_CHANGED_ONLY):
             raise InstallError(f"Generation is {freshness.value}; regenerate before Modify")
         outputs = _verified_outputs(generation_record, game, progress_callback=progress_callback)
+        if any(not _is_mod_target(relative) for relative in outputs):
+            raise InstallError("Generated outputs must be installed as manager-mod files")
         output_hashes = _output_hashes(generation_record)
-        if any(_is_mod_target(relative) for relative in outputs) or manifest.created_directories:
-            _validate_mod_inventory(_normalized_path(game.root), manifest)
+        _validate_mod_inventory(_normalized_path(game.root), manifest)
         output_paths = set(outputs)
         old_paths = set(manifest.target_files)
         union = output_paths | old_paths
-        all_targets = _copy_new_backups(
-            manifest, game, output_paths, progress_callback=progress_callback,
-        )
-        _require_generation_baselines({relative: all_targets[relative] for relative in output_paths},
-                                      generation_record, manifest.backup_directory)
         final_targets = {
-            relative: replace(all_targets[relative],
-                              installed_sha256=output_hashes[relative])
+            relative: InstallTarget(relative, output_hashes[relative])
             for relative in sorted(output_paths)
         }
         final = _make_manifest(
-            game, generation_record, state, manifest.backup_directory,
-            manifest.install_id, final_targets, active=True,
+            game, generation_record, state, manifest.install_id, final_targets, active=True,
         )
         prepared_targets = dict(manifest.target_files)
         prepared_targets.update(final_targets)
@@ -1577,60 +1456,57 @@ def modify_install(game: GameInstallation, generation_record: GenerationRecord,
         desired_hashes = dict(output_hashes)
         expected = {}
         if union:
-            report_progress(progress_callback, "Modify: preparing replacement and restoration sources", 0, len(union))
+            report_progress(progress_callback, "Modify: preparing managed files", 0, len(union))
         for number, relative in enumerate(sorted(union), 1):
             previous = manifest.target_files.get(relative)
             if previous is not None:
                 expected[relative] = previous.installed_sha256
             else:
-                expected[relative] = all_targets[relative].original_sha256
+                expected[relative] = None
             if relative not in outputs:
-                original = (_validate_backup(manifest, relative, previous)
-                            if previous.original_exists else None)
-                desired_sources[relative] = original
-                desired_hashes[relative] = previous.original_sha256
-            report_progress(progress_callback, "Modify: preparing replacement and restoration sources", number, len(union))
-        final = _apply_transaction(game, state, manifest.backup_directory,
+                desired_sources[relative] = None
+                desired_hashes[relative] = None
+            report_progress(progress_callback, "Modify: preparing managed files", number, len(union))
+        final = _apply_transaction(game, state,
                            prepared, final, manifest,
                            desired_sources, desired_hashes, expected,
                            pre_mutation_check=lambda: _revalidate_before_mutation(
-                               generation_record, game, overrides, progress_callback=progress_callback),
+                               generation_record, game, progress_callback=progress_callback),
                            progress_callback=progress_callback, operation_name="Modify")
         return final
 
 
 def uninstall(game: GameInstallation, manifest: InstallManifest, *,
               progress_callback: ProgressCallback | None = None) -> UninstallResult:
-    """Restore exact originals unless any managed file has been externally edited."""
+    """Remove manager-mod files installed by this manifest."""
     _validate_manifest(manifest, game.root)
     if manifest.prepared:
         raise InstallError("A previous operation left a prepared manifest; explicit recovery is required")
     if not manifest.active:
-        return UninstallResult((), manifest.backup_directory)
+        return UninstallResult(())
     state = _validate_state_directory(manifest.state_directory, game.root)
     with _OperationLock(state):
         _ensure_game_closed()
         conflicts = _active_conflicts(manifest, game, progress_callback=progress_callback)
         if conflicts:
             _persist_conflicts(manifest, conflicts)
-            return UninstallResult((), manifest.backup_directory, conflicts, ())
+            return UninstallResult((), conflicts)
         sources = {}
         hashes = {}
         expected = {}
         if manifest.target_files:
-            report_progress(progress_callback, "Uninstall: validating restore sources", 0, len(manifest.target_files))
+            report_progress(progress_callback, "Uninstall: preparing managed files", 0, len(manifest.target_files))
         for number, (relative, target) in enumerate(sorted(manifest.target_files.items()), 1):
-            sources[relative] = (_validate_backup(manifest, relative, target)
-                                 if target.original_exists else None)
-            hashes[relative] = target.original_sha256
+            sources[relative] = None
+            hashes[relative] = None
             expected[relative] = target.installed_sha256
-            report_progress(progress_callback, "Uninstall: validating restore sources",
+            report_progress(progress_callback, "Uninstall: preparing managed files",
                             number, len(manifest.target_files))
         prepared = replace(manifest, schema_version=INSTALL_MANIFEST_SCHEMA, conflicted=False, conflict_paths=(), prepared=True)
         final = replace(manifest, schema_version=INSTALL_MANIFEST_SCHEMA, active=False, conflicted=False,
                         conflict_paths=(), prepared=False)
         try:
-            _apply_transaction(game, state, manifest.backup_directory,
+            _apply_transaction(game, state,
                                prepared, final, manifest,
                                sources, hashes, expected,
                                progress_callback=progress_callback, operation_name="Uninstall")
@@ -1651,7 +1527,6 @@ def uninstall(game: GameInstallation, manifest: InstallManifest, *,
                 except (OSError, InstallError):
                     failed_paths.add(relative)
             return UninstallResult(
-                (), manifest.backup_directory, tuple(sorted(failed_paths)),
-                error.rollback_errors, str(error),
+                (), tuple(sorted(failed_paths)), error.rollback_errors, str(error),
             )
-        return UninstallResult(tuple(sorted(sources)), manifest.backup_directory)
+        return UninstallResult(tuple(sorted(sources)))
