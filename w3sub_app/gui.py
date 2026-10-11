@@ -379,6 +379,18 @@ def show_scrollable_dialog(parent: tk.Misc, title: str, text: str,
     return result["accepted"] if confirm else None
 
 
+def read_application_log() -> str:
+    """Read the latest application log contents for display in the GUI."""
+    path = config.log_file_path()
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"No application log has been written yet.\n\nLog path: {path}"
+    except OSError as error:
+        return f"Unable to read the application log: {error}\n\nLog path: {path}"
+    return contents or f"The application log is empty.\n\nLog path: {path}"
+
+
 def install_manifest_review_signature(manifest: InstallManifest) -> tuple:
     """Identify the active manager-mod targets shown in a confirmation."""
     targets = tuple(sorted(
@@ -595,6 +607,8 @@ class W3DualSubtitleApp:
         self.uninstall_button.pack(side="left", padx=6)
         self.rescan_button = ttk.Button(commands, text="Rescan", command=self._rescan_current)
         self.rescan_button.pack(side="right")
+        self.log_button = ttk.Button(commands, text="Log", command=self._show_log)
+        self.log_button.pack(side="right", padx=(0, 6))
         self.help_button = ttk.Button(frame, text="Help", command=lambda: show_help(self.root))
         self.help_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
@@ -638,6 +652,7 @@ class W3DualSubtitleApp:
             (self.modify_button, "Apply the preview to the manager mod."),
             (self.uninstall_button, "Remove the manager-mod files installed by this app."),
             (self.rescan_button, "Refresh resource inventory, preview freshness, and managed install conflicts."),
+            (self.log_button, "View the latest application log messages."),
             (self.help_button, "Read the four-step workflow, merge modes, and install/uninstall explanation."),
         )
         for widget, hint in hints:
@@ -652,6 +667,9 @@ class W3DualSubtitleApp:
             return False
         self.root.destroy()
         return True
+
+    def _show_log(self):
+        show_scrollable_dialog(self.root, "Application log", read_application_log())
 
     def _submit(self, label, operation, on_success):
         if self._busy:

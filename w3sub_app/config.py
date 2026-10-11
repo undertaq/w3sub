@@ -13,6 +13,7 @@ from .models import AppConfig
 APP_DIRECTORY = "W3DualSubtitle"
 CONFIG_FILENAME = "config.json"
 _LOGGER_NAME = "w3dual_subtitle"
+LOG_FILENAME = "w3dual-subtitle.log"
 
 
 def app_state_root() -> Path:
@@ -128,7 +129,7 @@ def configure_logging() -> logging.Logger:
     logger = logging.getLogger(_LOGGER_NAME)
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    expected = (root / "w3dual-subtitle.log").resolve()
+    expected = log_file_path().resolve()
     if not any(getattr(handler, "baseFilename", None) == str(expected)
                for handler in logger.handlers):
         handler = RotatingFileHandler(expected, maxBytes=2_000_000, backupCount=3,
@@ -138,3 +139,8 @@ def configure_logging() -> logging.Logger:
         ))
         logger.addHandler(handler)
     return logger
+
+
+def log_file_path() -> Path:
+    """Return the current rotating application log path."""
+    return app_state_root().expanduser().resolve() / LOG_FILENAME
