@@ -1053,10 +1053,28 @@ class W3DualSubtitleApp:
         try:
             primary, secondary = self.primary_var.get(), self.secondary_var.get()
             if not primary or not secondary or primary.casefold() == secondary.casefold():
+                self.logger.warning(
+                    "Language resource pairing failed: choose two different languages "
+                    "(game=%s, primary=%r, secondary=%r)",
+                    self.snapshot.selected.game.root, primary, secondary,
+                )
                 return False
             sources = generation._source_paths(self.snapshot.selected.game, primary, secondary)
-            return all(path.is_file() for path in sources.values())
+            missing = [str(path) for path in sources.values() if not path.is_file()]
+            if missing:
+                self.logger.warning(
+                    "Language resource pairing failed: missing resource files %s "
+                    "(game=%s, primary=%r, secondary=%r)",
+                    missing, self.snapshot.selected.game.root, primary, secondary,
+                )
+                return False
+            return True
         except Exception:
+            self.logger.exception(
+                "Language resource pairing failed (game=%s, primary=%r, secondary=%r)",
+                self.snapshot.selected.game.root,
+                self.primary_var.get(), self.secondary_var.get(),
+            )
             return False
 
     def _refresh_action_buttons(self):
