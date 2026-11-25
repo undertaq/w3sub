@@ -43,7 +43,7 @@ from .models import (
 )
 
 
-APP_VERSION = "0.1.14"
+APP_VERSION = "0.1.15"
 GENERATION_RECORD_SCHEMA = 2
 
 

@@ -178,26 +178,20 @@ def scan_game(root: Path, storefront: Storefront, store_build_id: str | None = N
     version = match[1]
     languages: dict[str, list[Path]] = {}
 
-    def fail(error):
-        raise error
-
-    for directory in (root / "content", root / "dlc"):
-        try:
-            metadata = directory.stat()
-        except FileNotFoundError:
-            if directory == root / "dlc":
-                continue
-            raise
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(f"Resource root is not a directory: {directory}")
-        directory.resolve().relative_to(root)
-        for parent, _, names in os.walk(directory, onerror=fail, followlinks=False):
-            for name in names:
-                path = Path(parent) / name
-                if path.suffix.casefold() != ".w3strings" or not re.fullmatch(r"[a-z]{2,4}", path.stem, re.I):
-                    continue
-                path.resolve().relative_to(root)
-                languages.setdefault(path.stem.casefold(), []).append(path)
+    # Remastered language resources are consolidated in content0. Legacy
+    # content/DLC copies must not add languages or create unmatched pairs.
+    directory = root / "content" / "content0"
+    metadata = directory.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"Resource root is not a directory: {directory}")
+    directory.resolve().relative_to(root)
+    for path in directory.iterdir():
+        if path.suffix.casefold() != ".w3strings" or not re.fullmatch(r"[a-z]{2,4}", path.stem, re.I):
+            continue
+        path.resolve().relative_to(root)
+        if not stat.S_ISREG(path.stat().st_mode):
+            continue
+        languages.setdefault(path.stem.casefold(), []).append(path)
     inventory = {language: tuple(sorted(paths, key=lambda p: p.relative_to(root).as_posix()))
                  for language, paths in sorted(languages.items())}
     return GameInstallation(root, storefront, GameVersion(version, store_build_id, raw_version), inventory)

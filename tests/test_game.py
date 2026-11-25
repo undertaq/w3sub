@@ -15,7 +15,7 @@ class GameTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "game"
-        (self.root / "content").mkdir(parents=True)
+        (self.root / "content" / "content0").mkdir(parents=True)
 
     def asset(self, relative, data=b"fixture"):
         path = self.root / relative
@@ -29,7 +29,7 @@ class GameTests(unittest.TestCase):
 
     def test_x64_supported_without_dlc_preserves_version_and_build(self):
         self.asset("bin/x64/witcher3.exe")
-        self.asset("content/en.w3strings")
+        self.asset("content/content0/en.w3strings")
         result = self.scan(build="25646871")
         self.assertEqual(result.root, self.root.resolve())
         self.assertEqual(result.storefront, Storefront.STEAM)
@@ -85,15 +85,14 @@ class GameTests(unittest.TestCase):
         self.assertEqual(result.version.executable_version_raw, raw)
         self.assertEqual(result.version.executable_version, "5.0.0.1044392")
 
-    def test_unreadable_optional_resource_root_is_not_omitted(self):
+    def test_unreadable_content0_is_reported(self):
         self.asset("bin/x64/witcher3.exe")
-        self.asset("content/en.w3strings")
-        self.asset("dlc/expansion/en.w3strings")
-        dlc = self.root / "dlc"
+        self.asset("content/content0/en.w3strings")
+        content0 = self.root / "content" / "content0"
         original_stat = os.stat
         for error in (PermissionError(13, "Access denied"), OSError(5, "I/O error")):
             def inaccessible(path, *args, **kwargs):
-                if Path(path) == dlc:
+                if Path(path) == content0:
                     raise error
                 return original_stat(path, *args, **kwargs)
             with self.subTest(error=type(error).__name__), patch.object(os, "stat", inaccessible):
@@ -104,23 +103,74 @@ class GameTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.scan()
         self.asset("bin/x64/witcher3.exe")
+        (self.root / "content" / "content0").rmdir()
         (self.root / "content").rmdir()
         with self.assertRaises(ValueError):
             self.scan()
 
-    def test_language_inventory_sorted_and_limited_to_resource_roots(self):
+    def test_language_inventory_uses_only_files_directly_in_content0(self):
         self.asset("bin/x64_dx12/witcher3.exe")
-        paths = [self.asset("content/z/en.w3strings"), self.asset("content/a/en.w3strings")]
-        dlc = self.asset("dlc/expansion/en.w3strings")
-        self.asset("content/cn.w3strings")
+        english = self.asset("content/content0/en.w3strings")
+        self.asset("content/content0/cn.w3strings")
+        japanese = self.asset("content/content0/JP.W3STRINGS")
+        self.asset("content/content0/nested/en.w3strings")
+        self.asset("content/content1/en.w3strings")
+        self.asset("content/en.w3strings")
+        self.asset("dlc/expansion/en.w3strings")
         self.asset("dlc/expansion/esmx.w3strings")
-        self.asset("content/JP.W3STRINGS")
         self.asset("dlc-tombstones/xx.w3strings")
         self.asset("mods/yy.w3strings")
-        self.asset("content/invalid-name.w3strings")
+        self.asset("content/content0/invalid-name.w3strings")
+        (self.root / "content/content0/fr.w3strings").mkdir()
         result = self.scan()
-        self.assertEqual(tuple(result.language_files), ("cn", "en", "esmx", "jp"))
-        self.assertEqual(result.language_files["en"], (paths[1], paths[0], dlc))
+        self.assertEqual(tuple(result.language_files), ("cn", "en", "jp"))
+        self.assertEqual(result.language_files["en"], (english,))
+        self.assertEqual(result.language_files["jp"], (japanese,))
+
+    def test_extra_chinese_resources_outside_content0_do_not_block_pairing(self):
+        from w3sub_app.generation import _source_paths, compare_generation, generate
+        from w3sub_app.models import Freshness, GenerationRequest, MergeMode
+        from w3sub_app.w3strings_native import StringsFile, decode, encode
+
+        self.asset("bin/x64/witcher3.exe")
+        english = self.asset("content/content0/en.w3strings")
+        chinese = self.asset("content/content0/zh.w3strings")
+        for path, text in ((english, "English"), (chinese, "Chinese")):
+            path.write_bytes(encode(StringsFile(164, 0, ((1, text),), ())))
+        ignored = [self.asset(relative) for relative in (
+            "content/content1/zh.w3strings",
+            "content/content12/zh.w3strings",
+            "dlc/DLC1/content/zh.w3strings",
+            "dlc/bob/content/zh.w3strings",
+            "dlc/ep1/content/zh.w3strings",
+        )]
+        result = self.scan()
+        self.assertEqual(result.language_files, {"en": (english,), "zh": (chinese,)})
+        self.assertEqual(_source_paths(result, "zh", "en"), {
+            "content/content0/zh.w3strings": chinese,
+            "content/content0/en.w3strings": english,
+        })
+        self.assertTrue(all(path.read_bytes() == b"fixture" for path in ignored))
+        record = generate(
+            GenerationRequest(result, "zh", "en", MergeMode.FULL_TEXT,
+                              include_cutscenes=False),
+            self.root.parent / "state",
+        )
+        self.assertEqual(set(record.output_files), {"content/content0/zh.w3strings"})
+        output = Path(record.output_files["content/content0/zh.w3strings"])
+        self.assertEqual(decode(output.read_bytes()).strings, ((1, "Chinese English"),))
+        self.assertEqual(set(record.source_fingerprint.entries), {
+            "content/content0/en.w3strings", "content/content0/zh.w3strings",
+        })
+        ignored[0].write_bytes(b"changed ignored file")
+        self.assertEqual(compare_generation(record, self.scan()), Freshness.CURRENT)
+
+    def test_missing_content0_does_not_fall_back_to_other_directories(self):
+        self.asset("bin/x64/witcher3.exe")
+        (self.root / "content/content0").rmdir()
+        self.asset("content/content1/zh.w3strings")
+        with self.assertRaises(FileNotFoundError):
+            self.scan()
 
     def test_version_read_failure_is_not_accepted(self):
         self.asset("bin/x64/witcher3.exe")
